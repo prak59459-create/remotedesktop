@@ -13,11 +13,13 @@ final class SecurityTests: XCTestCase {
     override func setUp() {
         tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("rdtest-\(UUID().uuidString)")
         DataDirectory.overridePath = tmpDir.path
+        TCPConnection.treatLoopbackAsLAN = true // 同じ PC 内の通し試験のため
     }
 
     override func tearDown() {
         try? FileManager.default.removeItem(at: tmpDir)
         DataDirectory.overridePath = nil
+        TCPConnection.treatLoopbackAsLAN = false
     }
 
     /// OS に空きポートを選ばせる (固定番号は外向き接続の一時ポートと衝突しうる)
@@ -556,15 +558,67 @@ final class SecurityTests: XCTestCase {
         XCTAssertTrue(store.all.isEmpty)
         XCTAssertThrowsError(try store.add(publicKey: [1], name: "x"))
 
-        // 署名のない古い形式に差し替える攻撃
-        try Data("[]".utf8).write(to: url)
+        // 署名のない古い形式に差し替える攻撃 (常に改ざん扱い。移行用の抜け道は無い)
+        try Data("[{\"publicKey\":\"00\",\"name\":\"evil\",\"added\":\"2026-01-01T00:00:00Z\"}]".utf8).write(to: url)
         XCTAssertTrue(try TrustStore(fileName: "devices.json", integrityKey: key).isTampered)
-        // 初めて鍵を作ったときだけ、古い形式を受け入れて署名付きに移行する
-        let migrated = try TrustStore(fileName: "devices.json", integrityKey: key, acceptUnsignedOnce: true)
-        XCTAssertFalse(migrated.isTampered)
-        XCTAssertFalse(try TrustStore(fileName: "devices.json", integrityKey: key).isTampered)
         // 鍵が違えば改ざん扱い
+        try store.reset()
         XCTAssertTrue(try TrustStore(fileName: "devices.json", integrityKey: [UInt8](repeating: 6, count: 32)).isTampered)
+        // 署名の鍵はホストの秘密鍵から導出する (鍵だけ消して作り直させる迂回ができない)
+        let host = StaticIdentity.generate()
+        XCTAssertEqual(TrustStore.integrityKey(for: host), TrustStore.integrityKey(for: host))
+        XCTAssertNotEqual(TrustStore.integrityKey(for: host), TrustStore.integrityKey(for: .generate()))
+    }
+
+    // MARK: セキュリティレビューで見つかった問題の回帰テスト
+
+    func testLoopbackIsNotLANByDefault() throws {
+        TCPConnection.treatLoopbackAsLAN = false
+        // トンネル (ngrok など) は外からの接続を 127.0.0.1 から届けるので、LAN 扱いしてはいけない
+        let env = try startHost()
+        let w = env.gate.startPairing()
+        XCTAssertThrowsError(try viewerConnect(env, viewer: .generate(), code: w.code, known: .inMemoryForTesting())) { e in
+            guard case AuthError.rejected(.pairingFailed, _) = e else { return XCTFail("\(e)") }
+        }
+        XCTAssertTrue(w.isActive) // コードは使われていない
+    }
+
+    func testDeniedPairingDoesNotBurnTheCode() throws {
+        var approve = false
+        let env = try startHost(newDeviceConsent: { _, _, _, _ in approve })
+        let w = env.gate.startPairing()
+        let v = StaticIdentity.generate()
+        XCTAssertThrowsError(try viewerConnect(env, viewer: v, code: w.code, known: .inMemoryForTesting()))
+        XCTAssertTrue(w.isActive)
+        approve = true
+        let s = try viewerConnect(env, viewer: v, code: w.code, known: .inMemoryForTesting())
+        XCTAssertTrue(s.newlyPaired)
+        s.channel.close()
+        XCTAssertFalse(w.isActive) // 登録が確定したら使用済み
+    }
+
+    func testRevokeFromAnotherProcessIsNotUndone() throws {
+        let key = [UInt8](repeating: 9, count: 32)
+        let lost = StaticIdentity.generate().publicKey
+        let host = try TrustStore(fileName: "devices.json", integrityKey: key)  // 動いているホスト
+        try host.add(publicKey: lost, name: "lost")
+        let cli = try TrustStore(fileName: "devices.json", integrityKey: key)   // 別プロセスの RDHost --revoke
+        XCTAssertEqual(try cli.remove(matching: Fingerprint.hex(lost)), 1)
+        // ホストが (古い一覧を持ったまま) 別の端末を登録しても、失効は取り消されない
+        try host.add(publicKey: StaticIdentity.generate().publicKey, name: "new")
+        host.touch(publicKey: lost)
+        XCTAssertNil(try TrustStore(fileName: "devices.json", integrityKey: key).find(publicKey: lost))
+        XCTAssertEqual(try TrustStore(fileName: "devices.json", integrityKey: key).all.count, 1)
+    }
+
+    func testAuditLogChainSurvivesTwoWriters() throws {
+        let running = AuditLog(fileName: "audit-2.log") // 動いているホスト
+        running.record("HOST_START")
+        let cli = AuditLog(fileName: "audit-2.log")     // 別プロセスの RDHost --revoke
+        cli.record("DEVICE_REVOKED")
+        running.record("SESSION_START")
+        cli.record("ANOTHER")
+        XCTAssertEqual(AuditLog.verify(fileName: "audit-2.log"), .ok(lines: 4))
     }
 
     func testAuditLogHashChain() throws {

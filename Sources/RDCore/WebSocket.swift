@@ -272,8 +272,11 @@ final class WinHTTPWebSocket: WebSocketConnection {
     private let connection: HINTERNET
     private let socket: HINTERNET
     private let sendLock = NSLock()
-    private let closeLock = NSLock()
+    // ハンドルを閉じたあとに使わないための状態 (閉じた HINTERNET は別の接続に再利用されうる)
+    private let state = NSLock()
     private var closed = false
+    private var receiving = false
+    private var handleClosed = false
 
     init(url: URL) throws {
         let secure = url.scheme?.lowercased() == "wss"
@@ -324,6 +327,7 @@ final class WinHTTPWebSocket: WebSocketConnection {
 
     deinit {
         close()
+        if !handleClosed { WinHttpCloseHandle(socket) } // ここではもう誰も使っていない
         WinHttpCloseHandle(connection)
         WinHttpCloseHandle(session)
     }
@@ -335,7 +339,12 @@ final class WinHTTPWebSocket: WebSocketConnection {
         case .binary(let b): bytes = b; type = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
         case .text(let s): bytes = Array(s.utf8); type = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE
         }
+        // close() も sendLock を取るので、送信中にハンドルが閉じられることはない
         sendLock.lock(); defer { sendLock.unlock() }
+        state.lock()
+        let isClosed = closed
+        state.unlock()
+        guard !isClosed else { throw NetError.closed }
         let rc = bytes.withUnsafeMutableBytes { WinHttpWebSocketSend(socket, type, $0.baseAddress, DWORD($0.count)) }
         if rc != 0 { throw NetError.io("WebSocket 送信 (error \(rc))") }
     }
@@ -346,8 +355,25 @@ final class WinHTTPWebSocket: WebSocketConnection {
         while true {
             var read: DWORD = 0
             var type = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
+            state.lock()
+            if closed {
+                state.unlock()
+                throw NetError.closed
+            }
+            receiving = true
+            state.unlock()
             let rc = chunk.withUnsafeMutableBytes {
                 WinHttpWebSocketReceive(socket, $0.baseAddress, DWORD($0.count), &read, &type)
+            }
+            // 受信中に close() されていたら、ハンドルを閉じるのはこちらの役目
+            state.lock()
+            receiving = false
+            let mustClose = closed && !handleClosed
+            if mustClose { handleClosed = true }
+            state.unlock()
+            if mustClose {
+                WinHttpCloseHandle(socket)
+                throw NetError.closed
             }
             if rc != 0 { throw NetError.closed }
             if type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE { throw NetError.closed }
@@ -362,12 +388,19 @@ final class WinHTTPWebSocket: WebSocketConnection {
     }
 
     func close() {
-        closeLock.lock(); defer { closeLock.unlock() }
-        if closed { return }
+        sendLock.lock(); defer { sendLock.unlock() }
+        state.lock()
+        if closed {
+            state.unlock()
+            return
+        }
         closed = true
-        // close フレームを送り (相手の応答は待たない)、ハンドルを閉じて受信待ちも解除する
+        let idle = !receiving
+        if idle { handleClosed = true }
+        state.unlock()
+        // close フレームを送る。受信中なら、相手の close 応答で受信が終わった時点で receive() が閉じる
         _ = WinHttpWebSocketShutdown(socket, 1000, nil, 0)
-        WinHttpCloseHandle(socket)
+        if idle { WinHttpCloseHandle(socket) }
     }
 }
 #endif

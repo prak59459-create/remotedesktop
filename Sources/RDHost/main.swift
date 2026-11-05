@@ -100,9 +100,9 @@ let clients: TrustStore
 let roomToken: [UInt8]
 do {
     identity = try SecretStore.loadOrCreateIdentity(name: "host_identity")
-    // 許可端末の一覧は、DPAPI で守った鍵で署名する (ファイルだけ書き換えても端末を追加できない)
-    let mac = try SecretStore.loadOrCreateSecret(name: "trust_store_key")
-    clients = try TrustStore(fileName: "authorized_devices.json", integrityKey: mac.bytes, acceptUnsignedOnce: mac.created)
+    // 許可端末の一覧は、ホストの秘密鍵 (TPM + DPAPI で保護) から導出した鍵で署名する。
+    // ファイルだけ書き換えても、署名の鍵だけ消しても端末を追加できない。
+    clients = try TrustStore(fileName: "authorized_devices.json", integrityKey: TrustStore.integrityKey(for: identity))
     roomToken = try SecretStore.loadOrCreateSecret(name: "relay_room_token").bytes
 } catch {
     print("エラー: 鍵を読み込めません: \(error)")
@@ -159,6 +159,10 @@ if isRunningElevated() && !options.allowAdmin {
 }
 
 platformSetup()
+#if !os(Windows)
+// 同じ PC 内での自動テスト用 (Windows 版には無い)
+if ProcessInfo.processInfo.environment["RD_TEST_LOOPBACK_IS_LAN"] == "1" { TCPConnection.treatLoopbackAsLAN = true }
+#endif
 let audit = AuditLog()
 audit.mirror = { line, important in writeEventLog(line, warning: important) }
 ActiveSessions.shared.onDisconnect = options.onDisconnect
@@ -166,11 +170,25 @@ let gate = HostGatekeeper(identity: identity, clients: clients, audit: audit)
 gate.allowRemotePairing = options.allowRemotePairing
 gate.requirePostQuantum = options.requirePostQuantum
 gate.relayRoom = options.relay != nil ? RelayRoom.id(token: roomToken) : nil
-let consentLock = NSLock() // ダイアログは 1 つずつ
-let ask: HostGatekeeper.ConsentHandler = { name, fp, peer, isNew in
-    consentLock.lock(); defer { consentLock.unlock() }
-    return askConsent(name: name, fingerprint: fp, peer: peer, isNew: isNew)
+/// 確認ダイアログは同時に 1 つだけ。開いている間に来た要求は待たせずに拒否する
+/// (答えのないダイアログの後ろに接続が溜まって、ホストが受け付けられなくなるのを防ぐ)
+final class ConsentGate {
+    private let lock = NSLock()
+    private var open = false
+    func ask(_ name: String, _ fp: String, _ peer: String, _ isNew: Bool) -> Bool {
+        lock.lock()
+        if open {
+            lock.unlock()
+            return false
+        }
+        open = true
+        lock.unlock()
+        defer { lock.lock(); open = false; lock.unlock() }
+        return askConsent(name: name, fingerprint: fp, peer: peer, isNew: isNew)
+    }
 }
+let consentGate = ConsentGate()
+let ask: HostGatekeeper.ConsentHandler = { consentGate.ask($0, $1, $2, $3) }
 gate.newDeviceConsent = ask // 新しい端末の登録は必ず画面で確認
 if options.confirm { gate.consent = ask }
 

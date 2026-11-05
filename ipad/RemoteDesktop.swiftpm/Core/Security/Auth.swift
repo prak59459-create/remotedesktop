@@ -186,15 +186,33 @@ public final class PairingWindow {
 
     public enum Outcome { case accepted, wrong, inactive }
 
-    public func consume(proof: [UInt8], handshakeHash: [UInt8]) -> Outcome {
+    /// 証明を確かめる (正しくてもまだ使用済みにはしない。画面での許可のあとで markUsed する)
+    public func check(proof: [UInt8], handshakeHash: [UInt8]) -> Outcome {
         lock.lock(); defer { lock.unlock() }
         guard !used, failures < maxFailures, Date() < expires else { return .inactive }
-        if code.verify(proof: proof, handshakeHash: handshakeHash) {
-            used = true
-            return .accepted
-        }
+        if code.verify(proof: proof, handshakeHash: handshakeHash) { return .accepted }
         failures += 1
         return .wrong
+    }
+
+    /// 登録が確定したら使用済みにする。すでに別の接続が使っていれば false
+    public func markUsed() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !used, Date() < expires else { return false }
+        used = true
+        return true
+    }
+
+    /// 画面で拒否された登録 (コードは使用済みにしないが、失敗として数える)
+    public func recordDenied() {
+        lock.lock(); defer { lock.unlock() }
+        failures += 1
+    }
+
+    public func consume(proof: [UInt8], handshakeHash: [UInt8]) -> Outcome {
+        let r = check(proof: proof, handshakeHash: handshakeHash)
+        if r == .accepted && !markUsed() { return .inactive }
+        return r
     }
 }
 
@@ -312,6 +330,7 @@ public final class HostGatekeeper {
         let name = sanitize(req.deviceName, maxLength: 64)
 
         var isNew = false
+        var pairingWindow: PairingWindow?
         clients.reload()
         if clients.isTampered {
             audit.record("TRUST_STORE_TAMPERED action=reject_all")
@@ -326,9 +345,10 @@ public final class HostGatekeeper {
             guard let window = currentPairing else {
                 throw reject(.pairingFailed, "ホストはペアリング受付中ではありません (RDHost --pair)")
             }
-            switch window.consume(proof: proof, handshakeHash: secure.handshakeHash) {
+            switch window.check(proof: proof, handshakeHash: secure.handshakeHash) {
             case .accepted:
                 isNew = true
+                pairingWindow = window
             case .wrong:
                 let left = window.isActive ? "" : " — 失敗回数が上限に達したためコードを無効化しました"
                 if !window.isActive { audit.record("PAIRING_CODE_REVOKED reason=too_many_failures") }
@@ -345,6 +365,8 @@ public final class HostGatekeeper {
         if let ask = consent ?? (isNew ? newDeviceConsent : nil) {
             tcp.setReceiveTimeout(0)
             guard ask(name, fp, peer, isNew) else {
+                // 拒否してもコードは使用済みにしない (本人がやり直せるように)。ただし失敗として数える
+                pairingWindow?.recordDenied()
                 throw reject(.rejectedByUser, "ホストの利用者が接続を拒否しました", countFailure: false)
             }
         } else if isNew {
@@ -352,6 +374,9 @@ public final class HostGatekeeper {
         }
 
         if isNew {
+            guard pairingWindow?.markUsed() == true else {
+                throw reject(.pairingFailed, "ペアリングコードは期限切れか使用済みです")
+            }
             do {
                 try clients.add(publicKey: secure.remoteStaticKey, name: name)
             } catch {

@@ -23,10 +23,14 @@ public enum DeviceKeyProtection {
 
     public enum Failure: Error, CustomStringConvertible {
         case notAuthenticated
+        case keyInvalidated
         case keychain(String)
         public var description: String {
             switch self {
-            case .notAuthenticated: return "本人確認ができなかったため、接続を中止しました"
+            case .keyInvalidated:
+                return "端末の鍵が使えなくなっています (Face ID を登録し直した場合など)。「端末の鍵をリセット」してからペアリングし直してください"
+            case .notAuthenticated:
+                return "本人確認ができなかったため、接続を中止しました (Face ID を登録し直した場合は「端末の鍵をリセット」してください)"
             case .keychain(let s): return "鍵の保管に失敗しました: \(s)"
             }
         }
@@ -44,7 +48,7 @@ public enum DeviceKeyProtection {
             let context = LAContext()
             context.localizedReason = reason
             guard let wrapKey = enclaveKey(tag: tag, context: context) else {
-                throw Failure.keychain("Secure Enclave の鍵が見つかりません (生体情報を登録し直した場合は再ペアリングが必要です)")
+                throw Failure.keyInvalidated
             }
             var err: Unmanaged<CFError>?
             guard let raw = SecKeyCreateDecryptedData(wrapKey, algorithm, Data(sealed) as CFData, &err) as Data? else {
@@ -53,7 +57,8 @@ public enum DeviceKeyProtection {
             return (try StaticIdentity(rawPrivateKey: [UInt8](raw)), .secureEnclave)
         }
 
-        // 新しく作る: まず Secure Enclave を試す
+        // 新しく作る: 古い Secure Enclave の鍵が残っていれば消してから (同じタグの鍵を重ねない)
+        SecItemDelete([kSecClass as String: kSecClassKey, kSecAttrApplicationTag as String: tag] as CFDictionary)
         if let wrapKey = createEnclaveKey(tag: tag), let pub = SecKeyCopyPublicKey(wrapKey),
            SecKeyIsAlgorithmSupported(pub, .encrypt, algorithm) {
             let id = StaticIdentity.generate()
@@ -67,6 +72,19 @@ public enum DeviceKeyProtection {
         // 使えない環境: キーチェーン + アプリ側の本人確認
         let level: Level = try authenticate(reason: reason) ? .softwareGate : .none
         return (try SecretStore.loadOrCreateIdentity(name: name + ".keychain"), level)
+    }
+
+    /// 端末の鍵を消す (Face ID を登録し直して鍵が使えなくなったとき用)。次の接続で新しい鍵を作るので、
+    /// ホストとのペアリングをやり直す必要がある。
+    public static func reset(name: String) throws {
+        let tag = Data("RemoteDesktop.\(name).wrap".utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag,
+        ]
+        SecItemDelete(query as CFDictionary) // 同じタグの鍵がいくつあっても全部消す
+        try SecretStore.delete(name: name + ".sealed")
+        try SecretStore.delete(name: name + ".keychain")
     }
 
     private static func enclaveKey(tag: Data, context: LAContext) -> SecKey? {

@@ -206,12 +206,20 @@ func askConsent(name: String, fingerprint: String, peer: String, isNew: Bool) ->
     """
     let flags: UINT = 0x4 /* MB_YESNO */ | 0x30 /* MB_ICONWARNING */ | 0x100 /* MB_DEFBUTTON2 */
         | 0x1_0000 /* MB_SETFOREGROUND */ | 0x4_0000 /* MB_TOPMOST */
+    // 60 秒で答えがなければ「いいえ」扱い (席を外しているあいだに確認待ちが溜まらないように)。
+    // MessageBoxTimeoutW は user32.dll にある (ヘッダーには無い) ので、あれば使う。
+    typealias MessageBoxTimeout = @convention(c) (HWND?, LPCWSTR?, LPCWSTR?, UINT, WORD, DWORD) -> Int32
+    let timeoutFn: MessageBoxTimeout? = "user32.dll".withCString(encodedAs: UTF16.self) { lib in
+        guard let module = GetModuleHandleW(lib), let proc = GetProcAddress(module, "MessageBoxTimeoutW") else { return nil }
+        return unsafeBitCast(proc, to: MessageBoxTimeout.self)
+    }
     let r = text.withCString(encodedAs: UTF16.self) { t in
-        "RemoteDesktop — 接続の確認".withCString(encodedAs: UTF16.self) { c in
-            MessageBoxW(nil, t, c, flags)
+        "RemoteDesktop — 接続の確認 (60 秒で自動的に拒否)".withCString(encodedAs: UTF16.self) { c in
+            if let f = timeoutFn { return f(nil, t, c, flags, 0, 60_000) }
+            return MessageBoxW(nil, t, c, flags)
         }
     }
-    return r == 6 // IDYES
+    return r == 6 // IDYES (時間切れは 32000)
 }
 
 // MARK: - 切断時の画面保護

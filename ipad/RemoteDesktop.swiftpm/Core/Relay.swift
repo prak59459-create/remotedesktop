@@ -75,8 +75,9 @@ public final class RelayTransport: Transport {
             }
             guard case .binary(let b) = msg else { break } // データ経路はバイナリだけ
             cond.lock()
-            if offset > 0 && offset == buffer.count {
-                buffer.removeAll(keepingCapacity: true)
+            // 読み終えた部分を捨てる (受信側が少しでも遅れていると、ここで詰めないと際限なく増える)
+            if offset > 0 && (offset == buffer.count || offset >= 1 << 20) {
+                buffer.removeFirst(offset)
                 offset = 0
             }
             buffer += b

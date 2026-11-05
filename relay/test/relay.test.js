@@ -81,6 +81,18 @@ test('a host without the token cannot take a room', async () => {
   assert.strictEqual(await closed(v), 4004);
 });
 
+test('a second host with the same token does not kick out the first', async () => {
+  const token = newToken();
+  const first = await host(token);
+  const second = await open('/host?room=' + first.room);
+  second.send(JSON.stringify({ t: 'auth', token }));
+  assert.strictEqual(await closed(second), 4009);
+  // 最初のホストはそのまま使える
+  first.ws.send('ping');
+  assert.strictEqual((await next(first.ws)).d.toString(), 'pong');
+  first.ws.close();
+});
+
 test('viewer without host is closed', async () => {
   const v = await open('/connect?room=' + 'B'.repeat(26));
   assert.strictEqual(await closed(v), 4004);

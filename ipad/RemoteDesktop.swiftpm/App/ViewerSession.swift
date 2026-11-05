@@ -89,6 +89,18 @@ final class ViewerSession: ObservableObject {
         }.start()
     }
 
+    /// 端末の鍵と保存したホストを消す (次の接続で新しい鍵を作るので、ペアリングし直しが必要)
+    func resetDeviceKey() {
+        do {
+            try DeviceKeyProtection.reset(name: "viewer_identity_v2")
+            Self.savedHostKey = nil
+            alert = AlertItem(title: "端末の鍵をリセットしました",
+                              message: "同じ Wi-Fi で、ペアリングコードを使ってもう一度接続してください。")
+        } catch {
+            alert = AlertItem(title: "リセットできませんでした", message: "\(error)")
+        }
+    }
+
     func disconnect() {
         channel?.close()
         channel = nil

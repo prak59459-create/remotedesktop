@@ -178,8 +178,10 @@ function handleHost(ws, room, ip) {
   function register() {
     const existing = rooms.get(room);
     if (existing && existing.host.readyState === 1 && existing.host !== ws) {
-      // 同じトークンを持つホストが既にいる (二重起動など)。新しい方を優先して古い方を切る
-      existing.host.close(4010, 'replaced');
+      // 同じトークンのホストが既に生きている (二重起動など)。先に来た方を残す。
+      // 新しい方を優先すると、両方が再接続のたびに追い出し合い続ける。
+      // 古い方が死んでいれば、ハートビート (最大 60 秒) で消えたあとに登録できる。
+      return ws.close(4009, 'room in use');
     }
     if (!existing && rooms.size >= config.maxRooms) return ws.close(4029, 'server full');
     const state = existing || { host: ws, pending: new Map(), tokens: config.roomBurstBytes, last: Date.now() };

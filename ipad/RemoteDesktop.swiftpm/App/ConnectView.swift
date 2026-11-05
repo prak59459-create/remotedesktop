@@ -65,6 +65,10 @@ struct ConnectView: View {
                     Toggle("⌘ を Ctrl として送る", isOn: $session.commandAsControl)
                 }
 
+                Section(footer: Text("Face ID を登録し直して接続できなくなったときに使います。リセット後はペアリングし直してください。")) {
+                    Button("端末の鍵をリセット", role: .destructive) { session.resetDeviceKey() }
+                }
+
                 Section {
                     Button(action: connect) {
                         HStack {

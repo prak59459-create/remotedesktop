@@ -15,7 +15,15 @@ public protocol Transport: ByteStream {
 }
 
 extension TCPConnection: Transport {
-    public var isLocalNetwork: Bool { isPrivateIPv4(peerIP) }
+    /// ループバック (127.0.0.0/8) は LAN 扱いしない。ngrok・cloudflared・ssh -R などのトンネルは
+    /// インターネットからの接続を 127.0.0.1 から届けるので、LAN 限定の登録を迂回されてしまう。
+    /// (ルーターがポート転送で送信元を書き換える場合は見分けられないので、登録には画面での許可も必須にしている)
+    public var isLocalNetwork: Bool {
+        isPrivateIPv4(peerIP) && (!peerIP.hasPrefix("127.") || TCPConnection.treatLoopbackAsLAN)
+    }
+
+    /// テスト用 (同じ PC 内での通し試験)。本番では false のまま
+    public static var treatLoopbackAsLAN = false
 }
 
 /// RFC 1918 のプライベートアドレス、ループバック、リンクローカルか

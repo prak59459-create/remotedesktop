@@ -162,6 +162,18 @@ public enum SecretStore {
         #endif
     }
 
+    public static func delete(name: String) throws {
+        #if os(macOS) || os(iOS)
+        if useKeychain {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                           kSecAttrAccount as String: name] as CFDictionary)
+            return
+        }
+        #endif
+        let url = try DataDirectory.url().appendingPathComponent(fileName(name))
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private static func fileName(_ name: String) -> String {
         #if os(Windows)
         return name + ".dpapi"
@@ -344,22 +356,23 @@ public final class TrustStore {
     private let url: URL
     private let lock = NSLock()
     private let integrityKey: [UInt8]?
-    private let acceptLegacy: Bool
     private var entries: [Entry]
     public private(set) var isTampered = false
 
-    /// - integrityKey: 改ざん検知に使う秘密 (SecretStore で保護したもの)
-    /// - acceptUnsignedOnce: 署名のない古い形式を一度だけ受け入れる (秘密を初めて作ったときだけ true にする)
-    public init(fileName: String, integrityKey: [UInt8]? = nil, acceptUnsignedOnce: Bool = false) throws {
+    /// - integrityKey: 改ざん検知に使う秘密。ホストではホストの秘密鍵から導出する (HostIdentity.trustStoreKey)。
+    ///   独立したファイルにすると、それだけ消して作り直させる迂回ができてしまうため。
+    ///   署名のない一覧は、鍵を渡した場合は常に改ざん扱い (古い形式への移行は受け付けない)。
+    public init(fileName: String, integrityKey: [UInt8]? = nil) throws {
         url = try DataDirectory.url().appendingPathComponent(fileName)
         self.integrityKey = integrityKey
-        acceptLegacy = acceptUnsignedOnce
-        let (e, t) = Self.load(url, key: integrityKey, acceptLegacy: acceptUnsignedOnce)
+        let (e, t) = Self.load(url, key: integrityKey)
         entries = e
         isTampered = t
-        if integrityKey != nil && !t && acceptUnsignedOnce && SecureFile.read(url) != nil {
-            try persist() // 古い形式から署名付きへ移行
-        }
+    }
+
+    /// ホストの秘密鍵から、許可一覧の改ざん検知用の鍵を導出する
+    public static func integrityKey(for identity: StaticIdentity) -> [UInt8] {
+        noiseHMAC(key: identity.rawPrivateKey, Array("RemoteDesktop trust store key v1".utf8))
     }
 
     private static func decoder() -> JSONDecoder {
@@ -372,7 +385,7 @@ public final class TrustStore {
         noiseHMAC(key: key, Array("RemoteDesktop trust store v1".utf8) + bytes)
     }
 
-    private static func load(_ url: URL, key: [UInt8]?, acceptLegacy: Bool) -> ([Entry], Bool) {
+    private static func load(_ url: URL, key: [UInt8]?) -> ([Entry], Bool) {
         guard let data = SecureFile.read(url), !data.isEmpty else { return ([], false) }
         if let signed = try? decoder().decode(Signed.self, from: Data(data)) {
             let body = Array(signed.entries.utf8)
@@ -384,8 +397,8 @@ public final class TrustStore {
             return (e, false)
         }
         if let legacy = try? decoder().decode([Entry].self, from: Data(data)) {
-            // 署名が必要なのに署名がない = 書き換えられた可能性 (初回の移行時だけ受け入れる)
-            if key != nil && !acceptLegacy { return ([], true) }
+            // 署名が必要なのに署名がない = 書き換えられた可能性
+            if key != nil { return ([], true) }
             return (legacy, false)
         }
         return ([], key != nil)
@@ -393,8 +406,12 @@ public final class TrustStore {
 
     /// ディスクから読み直す (別プロセスでの --revoke を反映するため)
     public func reload() {
-        let (fresh, t) = Self.load(url, key: integrityKey, acceptLegacy: false)
         lock.lock(); defer { lock.unlock() }
+        reloadLocked()
+    }
+
+    private func reloadLocked() {
+        let (fresh, t) = Self.load(url, key: integrityKey)
         entries = fresh
         isTampered = t
     }
@@ -414,6 +431,7 @@ public final class TrustStore {
     public func add(publicKey: [UInt8], name: String, relayRoom: String? = nil) throws {
         let hex = Fingerprint.hex(publicKey)
         lock.lock(); defer { lock.unlock() }
+        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
         guard !isTampered else { throw StoreError.tampered }
         let old = entries.first { $0.publicKey == hex }
         entries.removeAll { $0.publicKey == hex }
@@ -426,6 +444,7 @@ public final class TrustStore {
     public func setRelayRoom(publicKey: [UInt8], room: String) throws {
         let hex = Fingerprint.hex(publicKey)
         lock.lock(); defer { lock.unlock() }
+        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
         guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
         guard entries[i].relayRoom != room else { return }
         entries[i].relayRoom = room
@@ -435,6 +454,7 @@ public final class TrustStore {
     public func touch(publicKey: [UInt8]) {
         let hex = Fingerprint.hex(publicKey)
         lock.lock(); defer { lock.unlock() }
+        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
         guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
         entries[i].lastSeen = Date()
         try? persist()
@@ -444,6 +464,7 @@ public final class TrustStore {
     public func remove(matching query: String) throws -> Int {
         let q = query.uppercased().replacingOccurrences(of: "-", with: "")
         lock.lock(); defer { lock.unlock() }
+        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
         guard !isTampered else { throw StoreError.tampered }
         let before = entries.count
         entries.removeAll { e in
@@ -528,17 +549,30 @@ public final class AuditLog {
         mirror?(body, important)
         guard let url = url else { return }
         lock.lock(); defer { lock.unlock() }
-        let h = Self.chain(lastHash, body)
-        lastHash = h
-        let line = body + Self.marker + Fingerprint.hex(h) + "\n"
         if !FileManager.default.fileExists(atPath: url.path) {
             try? SecureFile.write([], to: url)
         }
-        if let fh = try? FileHandle(forWritingTo: url) {
-            defer { try? fh.close() }
-            _ = try? fh.seekToEnd()
-            try? fh.write(contentsOf: Data(line.utf8))
-        }
+        guard let fh = try? FileHandle(forUpdating: url) else { return }
+        defer { try? fh.close() }
+        // 直前の行のハッシュはファイルの末尾から読む。別のプロセス (RDHost --revoke など) が
+        // 追記していても、チェーンが分岐しないように。
+        let prev = Self.lastHash(in: fh) ?? lastHash
+        let h = Self.chain(prev, body)
+        lastHash = h
+        _ = try? fh.seekToEnd()
+        try? fh.write(contentsOf: Data((body + Self.marker + Fingerprint.hex(h) + "\n").utf8))
+    }
+
+    /// ファイル末尾の行からハッシュを読む
+    static func lastHash(in fh: FileHandle) -> [UInt8]? {
+        guard let end = try? fh.seekToEnd(), end > 0 else { return genesis }
+        let start = end > 4096 ? end - 4096 : 0
+        try? fh.seek(toOffset: start)
+        guard let tail = try? fh.readToEnd() else { return nil }
+        let lines = String(decoding: tail, as: UTF8.self).split(separator: "\n")
+        guard let last = lines.last, let r = last.range(of: marker, options: .backwards),
+              let h = Fingerprint.fromHex(String(last[r.upperBound...])), h.count == 32 else { return nil }
+        return h
     }
 
     public enum Verification: Equatable {
