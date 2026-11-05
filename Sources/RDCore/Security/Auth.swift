@@ -92,7 +92,7 @@ public enum AuthError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .hostKeyMismatch(let fp):
-            return "⚠️ ホストの鍵がペアリングコードと一致しません。中間者攻撃の可能性があるため接続を中止しました。(相手の指紋: \(fp))"
+            return "⚠️ ホストの鍵が登録済みの鍵 (またはペアリングコード) と一致しません。なりすましの可能性があるため接続を中止しました。(相手の指紋: \(fp))"
         case .unknownHost(let fp):
             return "未登録のホストです (指紋: \(fp))。ホストで RDHost --pair を実行し、表示されたペアリングコードを入力してください。"
         case .rejected(let st, let msg):
@@ -198,6 +198,9 @@ public final class HostGatekeeper {
     public let limiter = RateLimiter()
     public var consent: ConsentHandler?
     public var handshakeTimeout: TimeInterval = 10
+    /// false (既定) なら、新しい端末の登録は LAN 内からの直接接続でだけ受け付ける。
+    /// コードを盗み見られても、外からは端末を追加できない。
+    public var allowRemotePairing = false
     public let maxPendingHandshakes = 4
 
     private var pairing: PairingWindow?
@@ -229,7 +232,7 @@ public final class HostGatekeeper {
     }
 
     /// 認証に成功したら Client を返す。失敗時は接続を閉じて例外。
-    public func authenticate(_ tcp: TCPConnection) throws -> Client {
+    public func authenticate(_ tcp: Transport) throws -> Client {
         let peer = tcp.peerDescription
         let ip = tcp.peerIP
 
@@ -287,6 +290,9 @@ public final class HostGatekeeper {
         if clients.find(publicKey: secure.remoteStaticKey) != nil {
             // 登録済みの端末
         } else if let proof = req.pairingProof {
+            guard tcp.isLocalNetwork || allowRemotePairing else {
+                throw reject(.pairingFailed, "新しい端末の登録は、同じ LAN (Wi-Fi) から直接接続したときだけ受け付けます")
+            }
             guard let window = currentPairing else {
                 throw reject(.pairingFailed, "ホストはペアリング受付中ではありません (RDHost --pair)")
             }
@@ -340,11 +346,52 @@ public enum ViewerConnector {
         public let newlyPaired: Bool
     }
 
-    /// 接続・ホスト検証・認証まで行う
+    /// 接続先
+    public enum Endpoint {
+        /// LAN 内などで直接 TCP 接続
+        case direct(host: String, port: UInt16)
+        /// 中継サーバー経由
+        case relay(URL)
+    }
+
+    /// 接続・ホスト検証・認証まで行う。
+    /// - expectedHostKey: 保存済みのホストに接続するときはその公開鍵。完全一致しなければ切断する。
+    /// - pairingCode: 初回のみ。ホスト鍵の指紋がコードと一致しなければ切断する。
+    public static func connect(to endpoint: Endpoint, identity: StaticIdentity, knownHosts: TrustStore,
+                               expectedHostKey: [UInt8]? = nil, pairingCode: PairingCode?,
+                               deviceName: String) throws -> Session {
+        let transport: Transport
+        let label: String
+        switch endpoint {
+        case let .direct(host, port):
+            transport = try TCPConnection.open(host: host, port: port)
+            label = "\(host):\(port)"
+        case let .relay(url):
+            let room: String
+            if let key = expectedHostKey {
+                room = RelayRoom.id(hostPublicKey: key)
+            } else if let code = pairingCode {
+                room = RelayRoom.id(fingerprintPrefix: code.hostFingerprintPrefix)
+            } else {
+                throw AuthError.unknownHost(fingerprint: "?")
+            }
+            transport = try RelayTransport.connect(relay: url, room: room)
+            label = "relay"
+        }
+        return try connect(transport: transport, label: label, identity: identity, knownHosts: knownHosts,
+                           expectedHostKey: expectedHostKey, pairingCode: pairingCode, deviceName: deviceName)
+    }
+
+    /// 互換用 (直接接続)
     public static func connect(host: String, port: UInt16, identity: StaticIdentity, knownHosts: TrustStore,
                                pairingCode: PairingCode?, deviceName: String) throws -> Session {
-        let tcp = try TCPConnection.open(host: host, port: port)
-        tcp.setReceiveTimeout(15)
+        try connect(to: .direct(host: host, port: port), identity: identity, knownHosts: knownHosts,
+                    pairingCode: pairingCode, deviceName: deviceName)
+    }
+
+    static func connect(transport tcp: Transport, label: String, identity: StaticIdentity, knownHosts: TrustStore,
+                        expectedHostKey: [UInt8]?, pairingCode: PairingCode?, deviceName: String) throws -> Session {
+        tcp.setReceiveTimeout(20)
         let secure: SecureStream
         do {
             secure = try SecureStream.connect(tcp, identity: identity)
@@ -357,8 +404,13 @@ public enum ViewerConnector {
 
         // ホストの本人確認。ここを通るまでは何も送らない。
         var proof: [UInt8]?
-        if let known = knownHosts.find(publicKey: hostKey) {
-            _ = known
+        if let expected = expectedHostKey {
+            guard expected == hostKey else {
+                secure.close()
+                throw AuthError.hostKeyMismatch(actual: fp)
+            }
+        } else if knownHosts.find(publicKey: hostKey) != nil {
+            // 信頼済みのホスト
         } else if let code = pairingCode {
             guard code.matches(hostPublicKey: hostKey) else {
                 secure.close()
@@ -385,7 +437,7 @@ public enum ViewerConnector {
         }
         tcp.setReceiveTimeout(0)
         if proof != nil {
-            try knownHosts.add(publicKey: hostKey, name: sanitize("\(host):\(port)"))
+            try knownHosts.add(publicKey: hostKey, name: sanitize(label))
         } else {
             knownHosts.touch(publicKey: hostKey)
         }

@@ -1,4 +1,8 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
 import Crypto
+#endif
 import Foundation
 
 // Noise Protocol Framework (rev 34) の Noise_XX_25519_ChaChaPoly_SHA256 実装。

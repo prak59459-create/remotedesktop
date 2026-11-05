@@ -20,6 +20,7 @@ public enum MessageType: UInt8 {
     case mouseWheel = 13      // dx i32, dy i32 (Windows の WHEEL_DELTA=120 単位)
     case key = 14             // code u16, flags u8
     case requestKeyframe = 15 // 全画面を送り直してもらう
+    case text = 16            // 文字列入力 (UTF-8)。ソフトウェアキーボードや IME の確定文字
 
     // 認証 (暗号化チャネル確立後、画面配信の前)
     case authRequest = 20     // AuthRequest
@@ -74,6 +75,9 @@ public enum ClientEvent: Equatable {
     case mouseButton(MouseButton, down: Bool)
     case mouseWheel(dx: Int32, dy: Int32)
     case key(code: UInt16, down: Bool, virtualKey: Bool)
+    case text(String)
+
+    public static let maxTextBytes = 1024
 
     public func encode() -> (MessageType, [UInt8]) {
         var w = ByteWriter(capacity: 8)
@@ -95,6 +99,8 @@ public enum ClientEvent: Equatable {
             w.u16(code)
             w.u8((down ? KeyFlag.down : 0) | (vk ? KeyFlag.virtualKey : 0))
             return (.key, w.bytes)
+        case let .text(s):
+            return (.text, Array(Array(s.utf8).prefix(Self.maxTextBytes)))
         }
     }
 
@@ -113,6 +119,9 @@ public enum ClientEvent: Equatable {
             let code = try r.u16()
             let flags = try r.u8()
             return .key(code: code, down: flags & KeyFlag.down != 0, virtualKey: flags & KeyFlag.virtualKey != 0)
+        case .text:
+            guard payload.count <= maxTextBytes else { return nil }
+            return .text(String(decoding: payload, as: UTF8.self))
         case .hello, .frame, .authRequest, .authResult: return nil
         }
     }

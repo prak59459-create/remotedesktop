@@ -2,3 +2,4 @@
 .swiftpm/
 dist/
 *.ppm
+node_modules/

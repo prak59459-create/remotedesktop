@@ -27,6 +27,7 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("Ws2_32", .when(platforms: [.windows])),
                 .linkedLibrary("Crypt32", .when(platforms: [.windows])),
+                .linkedLibrary("Winhttp", .when(platforms: [.windows])),
                 .linkedFramework("Security", .when(platforms: [.macOS])),
             ]
         ),

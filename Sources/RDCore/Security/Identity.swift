@@ -1,4 +1,8 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
 import Crypto
+#endif
 import Foundation
 
 /// 端末の長期鍵 (X25519)。ホストもビューアも 1 つずつ持ち、これが「身元」になる。

@@ -3,8 +3,7 @@ import RDCore
 
 /// ホストに接続して画面を受信し、入力イベントを送るクライアント (UI 非依存)
 final class ViewerClient {
-    let host: String
-    let port: UInt16
+    let endpoint: ViewerConnector.Endpoint
     let framebuffer = Framebuffer()
 
     /// 以下のコールバックは受信スレッドから呼ばれる
@@ -17,19 +16,32 @@ final class ViewerClient {
     private(set) var framesReceived = 0
     private(set) var session: ViewerConnector.Session?
     private let pairingCode: PairingCode?
+    private let expectedHostKey: [UInt8]?
 
-    init(host: String, port: UInt16, pairingCode: PairingCode? = nil) {
-        self.host = host
-        self.port = port
+    var label: String {
+        switch endpoint {
+        case let .direct(host, port): return "\(host):\(port)"
+        case let .relay(url): return "中継 \(url.host ?? "")"
+        }
+    }
+
+    init(endpoint: ViewerConnector.Endpoint, expectedHostKey: [UInt8]? = nil, pairingCode: PairingCode? = nil) {
+        self.endpoint = endpoint
+        self.expectedHostKey = expectedHostKey
         self.pairingCode = pairingCode
+    }
+
+    convenience init(host: String, port: UInt16, pairingCode: PairingCode? = nil) {
+        self.init(endpoint: .direct(host: host, port: port), pairingCode: pairingCode)
     }
 
     /// 接続・暗号化・相互認証 (ブロッキング) してから受信スレッドを起動する
     func connect() throws {
         let identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
         let known = try TrustStore(fileName: "trusted_hosts.json")
-        let s = try ViewerConnector.connect(host: host, port: port, identity: identity, knownHosts: known,
-                                            pairingCode: pairingCode, deviceName: deviceName())
+        let s = try ViewerConnector.connect(to: endpoint, identity: identity, knownHosts: known,
+                                            expectedHostKey: expectedHostKey, pairingCode: pairingCode,
+                                            deviceName: deviceName())
         session = s
         channel = s.channel
         Thread { [self] in receiveLoop() }.start()

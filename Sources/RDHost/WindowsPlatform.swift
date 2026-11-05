@@ -157,6 +157,27 @@ final class WindowsInputInjector: InputInjector {
         _ = SendInput(1, &input, Int32(MemoryLayout<INPUT>.size))
     }
 
+    func text(_ s: String) {
+        // KEYEVENTF_UNICODE (0x0004): UTF-16 の単位ごとに down / up を送る
+        var inputs: [INPUT] = []
+        for unit in s.utf16 {
+            for up in [false, true] {
+                var input = INPUT()
+                input.type = kINPUT_KEYBOARD
+                input.ki.wVk = 0
+                input.ki.wScan = WORD(unit)
+                input.ki.dwFlags = 0x0004 | (up ? kKEYEVENTF_KEYUP : 0)
+                input.ki.time = 0
+                input.ki.dwExtraInfo = 0
+                inputs.append(input)
+            }
+        }
+        guard !inputs.isEmpty else { return }
+        _ = inputs.withUnsafeMutableBufferPointer {
+            SendInput(UINT($0.count), $0.baseAddress, Int32(MemoryLayout<INPUT>.size))
+        }
+    }
+
     private func sendMouse(flags: DWORD, data: DWORD) {
         var input = INPUT()
         input.type = kINPUT_MOUSE

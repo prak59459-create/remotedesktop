@@ -1,5 +1,6 @@
 #if !os(Windows)
 import Foundation
+import RDCore
 
 // Windows 以外で RDHost を動かしたとき用 (開発・動作確認用)。
 // 動くテストパターンを配信し、受け取った入力はログに出す。
@@ -47,6 +48,7 @@ final class TestPatternCapturer: ScreenCapturer {
 }
 
 final class LoggingInputInjector: InputInjector {
+    func text(_ s: String) { print("[input] text \"\(sanitize(s))\"") }
     func moveMouse(x: Int, y: Int) { print("[input] move \(x),\(y)") }
     func mouseButton(_ button: Int, down: Bool) { print("[input] button \(button) \(down ? "down" : "up")") }
     func wheel(dx: Int32, dy: Int32) { print("[input] wheel dx=\(dx) dy=\(dy)") }

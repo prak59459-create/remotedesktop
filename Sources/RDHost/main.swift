@@ -12,6 +12,11 @@ func usage() -> Never {
 
     起動:
       --pair            新しい端末を登録するためのペアリングコードを表示 (10 分間・1 回限り有効)
+                        登録は同じ LAN (Wi-Fi) から直接つないだときだけ受け付ける
+      --relay URL       中継サーバー経由でも待ち受ける (例: https://xxxx.onrender.com)
+                        ルーターのポート開放は不要。中継サーバーには暗号文しか流れない
+      --no-direct       直接接続 (TCP) の待ち受けをしない (中継のみ)
+      --allow-remote-pairing  LAN 外 (中継経由・インターネット) からの端末登録も許可する (非推奨)
       --confirm         接続のたびに、この PC の画面で許可/拒否を確認する
       --bind ADDR       待ち受けるアドレス (例: 192.168.0.10)。既定は全インターフェース
       --port N          待ち受けポート (既定 \(defaultPort))
@@ -39,6 +44,14 @@ while let a = args.next() {
     case "--scale": options.scale = min(8, max(1, args.next().flatMap { Int($0) } ?? options.scale))
     case "--pair": options.pair = true
     case "--confirm": options.confirm = true
+    case "--relay":
+        guard let u = args.next().flatMap(URL.init(string:)), ["https", "wss", "http", "ws"].contains(u.scheme ?? "") else {
+            print("--relay には https:// で始まる URL を指定してください")
+            exit(1)
+        }
+        options.relay = u
+    case "--no-direct": options.direct = false
+    case "--allow-remote-pairing": options.allowRemotePairing = true
     case "--list": command = .list
     case "--revoke": command = .revoke(args.next() ?? "")
     case "--fingerprint": command = .fingerprint
@@ -93,6 +106,7 @@ case .serve:
 platformSetup()
 let audit = AuditLog()
 let gate = HostGatekeeper(identity: identity, clients: clients, audit: audit)
+gate.allowRemotePairing = options.allowRemotePairing
 if options.confirm {
     let consentLock = NSLock() // ダイアログは 1 つずつ
     gate.consent = { name, fp, peer, isNew in
@@ -101,15 +115,41 @@ if options.confirm {
     }
 }
 
-let listener: TCPListener
-do {
-    listener = try TCPListener(port: options.port, bindAddress: options.bindAddress)
-} catch {
-    print("エラー: \(error)")
+guard options.direct || options.relay != nil else {
+    print("エラー: --no-direct を使うときは --relay も指定してください")
     exit(1)
 }
 
-print("RDHost 待ち受け中: \(options.bindAddress ?? "0.0.0.0"):\(options.port)")
+func serve(_ transport: Transport) {
+    Thread {
+        do {
+            let client = try gate.authenticate(transport)
+            HostSession(client: client, gate: gate, options: options, audit: audit).run()
+        } catch {
+            // 理由は監査ログに記録済み
+        }
+    }.start()
+}
+
+var listener: TCPListener?
+if options.direct {
+    do {
+        listener = try TCPListener(port: options.port, bindAddress: options.bindAddress)
+    } catch {
+        print("エラー: \(error)")
+        exit(1)
+    }
+    print("直接接続: \(options.bindAddress ?? "0.0.0.0"):\(options.port) で待ち受け中")
+}
+if let relay = options.relay {
+    if relay.scheme == "http" || relay.scheme == "ws" {
+        print("⚠️ 中継サーバーへの経路が TLS ではありません (中身は端末間で暗号化済みですが、https:// を推奨します)")
+    }
+    let r = RelayHostListener(relay: relay, hostPublicKey: identity.publicKey) { audit.record($0) }
+    print("中継サーバー: \(relay.absoluteString) で待ち受け中 (ポート開放は不要)")
+    Thread { r.run(onIncoming: { serve($0) }) }.start()
+}
+
 print("ホストの指紋: \(identity.fingerprint)")
 print("登録済み端末: \(clients.all.count) 台\(options.confirm ? " / 接続時に確認あり" : "")")
 if options.pair {
@@ -119,27 +159,24 @@ if options.pair {
     ┌──────────────────────────────────────────────┐
       ペアリングコード:  \(w.code.string)
       (10 分間・1 回限り有効。他人に見せないでください)
+      \(options.allowRemotePairing ? "※ LAN 外からの登録も許可しています" : "iPad / Mac を同じ Wi-Fi につないで、この PC の IP アドレスに直接接続してください")
     └──────────────────────────────────────────────┘
 
     """)
 } else if clients.all.isEmpty {
-    print("※ 端末が未登録です。RDHost --pair で起動してペアリングしてください。")
+    print("※ 端末が未登録です。RDHost --pair で起動し、同じ Wi-Fi からペアリングしてください。")
 }
-audit.record("HOST_START port=\(options.port) pairing=\(options.pair) confirm=\(options.confirm)")
+audit.record("HOST_START direct=\(options.direct) relay=\(options.relay?.host ?? "-") pairing=\(options.pair) confirm=\(options.confirm) remote_pairing=\(options.allowRemotePairing)")
 
-while true {
-    do {
-        let conn = try listener.accept()
-        Thread {
-            do {
-                let client = try gate.authenticate(conn)
-                HostSession(client: client, gate: gate, options: options, audit: audit).run()
-            } catch {
-                // 理由は監査ログに記録済み
-            }
-        }.start()
-    } catch {
-        print("accept エラー: \(error)")
-        Thread.sleep(forTimeInterval: 0.5)
+if let l = listener {
+    while true {
+        do {
+            serve(try l.accept())
+        } catch {
+            print("accept エラー: \(error)")
+            Thread.sleep(forTimeInterval: 0.5)
+        }
     }
+} else {
+    while true { Thread.sleep(forTimeInterval: 3600) }
 }

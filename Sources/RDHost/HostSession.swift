@@ -9,6 +9,9 @@ struct HostOptions {
     var scale: Int = 1
     var pair = false
     var confirm = false
+    var relay: URL?
+    var direct = true
+    var allowRemotePairing = false
 }
 
 /// 認証済みの 1 つのビューア接続を担当する。画面送信ループと入力受信スレッドを持つ。
@@ -150,6 +153,8 @@ final class HostSession {
             injector.wheel(dx: dx, dy: dy)
         case let .key(code, down, vk):
             injector.key(code: code, down: down, virtualKey: vk)
+        case let .text(s):
+            injector.text(s)
         }
     }
 }

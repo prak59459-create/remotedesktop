@@ -136,7 +136,18 @@ public final class TCPConnection: ByteStream {
         setOpt(fd, kIPPROTO_TCP, kTCP_NODELAY, 1)
     }
 
-    deinit { close() }
+    // ファイルディスクリプタの解放は、このオブジェクトを誰も参照しなくなったときだけ行う。
+    // close() 直後に解放すると、別スレッドが送受信中の番号を OS が新しい接続に再利用し、
+    // 古いセッションのデータが新しい接続に書き込まれてしまう (use-after-close)。
+    deinit {
+        close()
+        rawClose(fd)
+    }
+
+    private var closedFlag: Bool {
+        closeLock.lock(); defer { closeLock.unlock() }
+        return isClosed
+    }
 
     /// host:port へ接続する。
     public static func open(host: String, port: UInt16) throws -> TCPConnection {
@@ -176,6 +187,7 @@ public final class TCPConnection: ByteStream {
 
     public func sendAll(_ buf: UnsafeRawBufferPointer) throws {
         guard let base = buf.baseAddress else { return }
+        guard !closedFlag else { throw NetError.closed }
         var off = 0
         while off < buf.count {
             let n = rawSend(fd, base + off, buf.count - off)
@@ -186,6 +198,7 @@ public final class TCPConnection: ByteStream {
 
     /// ちょうど n バイト読む。相手が切断したら NetError.closed。
     public func receive(exactly n: Int) throws -> [UInt8] {
+        guard !closedFlag else { throw NetError.closed }
         var out = [UInt8](repeating: 0, count: n)
         var off = 0
         try out.withUnsafeMutableBytes { buf in
@@ -222,8 +235,8 @@ public final class TCPConnection: ByteStream {
         defer { closeLock.unlock() }
         if isClosed { return }
         isClosed = true
+        // 通信を止めて、ブロック中の送受信を起こす (番号の解放は deinit で)
         rawShutdown(fd)
-        rawClose(fd)
     }
 }
 

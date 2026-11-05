@@ -29,7 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let positional = arguments.filter { !$0.hasPrefix("-") }
         if let host = positional.first {
             let port = positional.count > 1 ? UInt16(positional[1]) ?? defaultPort : defaultPort
-            openSession(host: host, port: port, pairingCode: nil, commandAsControl: true)
+            openSession(endpoint: .direct(host: host, port: port), pairingCode: nil, commandAsControl: true)
         } else {
             showConnectWindow()
         }
@@ -39,16 +39,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showConnectWindow() {
         if connectWindow == nil {
-            connectWindow = ConnectWindowController { [weak self] host, port, code, cmdAsCtrl in
-                self?.openSession(host: host, port: port, pairingCode: code, commandAsControl: cmdAsCtrl)
+            connectWindow = ConnectWindowController { [weak self] endpoint, code, cmdAsCtrl in
+                self?.openSession(endpoint: endpoint, pairingCode: code, commandAsControl: cmdAsCtrl)
             }
         }
         connectWindow?.showWindow(nil)
         connectWindow?.window?.makeKeyAndOrderFront(nil)
     }
 
-    private func openSession(host: String, port: UInt16, pairingCode: PairingCode?, commandAsControl: Bool) {
-        let s = SessionWindowController(host: host, port: port, pairingCode: pairingCode,
+    private func openSession(endpoint: ViewerConnector.Endpoint, pairingCode: PairingCode?, commandAsControl: Bool) {
+        var key: [UInt8]?
+        if case .relay = endpoint, pairingCode == nil {
+            // 中継で 2 回目以降: 最後にペアリングしたホストの鍵で部屋を決め、その鍵と完全一致を要求する
+            key = UserDefaults.standard.string(forKey: "lastHostKey").flatMap(Fingerprint.fromHex)
+            if key == nil {
+                let a = NSAlert()
+                a.messageText = "まだペアリングしていません"
+                a.informativeText = "最初は同じ Wi-Fi で、ホストの IP アドレスとペアリングコードを入力して接続してください。"
+                a.runModal()
+                return
+            }
+        }
+        let s = SessionWindowController(endpoint: endpoint, expectedHostKey: key, pairingCode: pairingCode,
                                         commandAsControl: commandAsControl)
         s.onClosed = { [weak self, weak s] in
             self?.sessions.removeAll { $0 === s }
@@ -87,12 +99,13 @@ final class ConnectWindowController: NSWindowController {
     private let hostField = NSTextField(string: UserDefaults.standard.string(forKey: "lastHost") ?? "")
     private let portField = NSTextField(string: UserDefaults.standard.string(forKey: "lastPort") ?? String(defaultPort))
     private let codeField = NSTextField(string: "")
+    private let relayField = NSTextField(string: UserDefaults.standard.string(forKey: "relayURL") ?? "")
     private let cmdCheck = NSButton(checkboxWithTitle: "⌘ を Ctrl として送る (オフなら Windows キー)", target: nil, action: nil)
-    private let onConnect: (String, UInt16, PairingCode?, Bool) -> Void
+    private let onConnect: (ViewerConnector.Endpoint, PairingCode?, Bool) -> Void
 
-    init(onConnect: @escaping (String, UInt16, PairingCode?, Bool) -> Void) {
+    init(onConnect: @escaping (ViewerConnector.Endpoint, PairingCode?, Bool) -> Void) {
         self.onConnect = onConnect
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 230),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 270),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Windows に接続"
         super.init(window: window)
@@ -102,6 +115,7 @@ final class ConnectWindowController: NSWindowController {
         portField.placeholderString = String(defaultPort)
         codeField.placeholderString = "初回のみ: RDHost --pair で表示されるコード"
         codeField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        relayField.placeholderString = "外出先: https://xxxx.onrender.com (空なら直接接続)"
         cmdCheck.state = UserDefaults.standard.object(forKey: "cmdAsCtrl") as? Bool == false ? .off : .on
 
         let connect = NSButton(title: "接続", target: self, action: #selector(connectPressed))
@@ -111,6 +125,7 @@ final class ConnectWindowController: NSWindowController {
             [NSTextField(labelWithString: "ホスト:"), hostField],
             [NSTextField(labelWithString: "ポート:"), portField],
             [NSTextField(labelWithString: "ペアリングコード:"), codeField],
+            [NSTextField(labelWithString: "中継サーバー:"), relayField],
             [NSGridCell.emptyContentView, cmdCheck],
             [NSGridCell.emptyContentView, connect],
         ])
@@ -131,7 +146,9 @@ final class ConnectWindowController: NSWindowController {
 
     @objc private func connectPressed() {
         let host = hostField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !host.isEmpty else { NSSound.beep(); return }
+        let relayText = relayField.stringValue.trimmingCharacters(in: .whitespaces)
+        let relay = relayText.isEmpty ? nil : URL(string: relayText)
+        guard !host.isEmpty || relay != nil else { NSSound.beep(); return }
         let port = UInt16(portField.stringValue) ?? defaultPort
         let cmdAsCtrl = cmdCheck.state == .on
         var code: PairingCode?
@@ -148,10 +165,11 @@ final class ConnectWindowController: NSWindowController {
         }
         codeField.stringValue = "" // 使い捨てなので残さない
         UserDefaults.standard.set(host, forKey: "lastHost")
+        UserDefaults.standard.set(relayText, forKey: "relayURL")
         UserDefaults.standard.set(String(port), forKey: "lastPort")
         UserDefaults.standard.set(cmdAsCtrl, forKey: "cmdAsCtrl")
         window?.orderOut(nil)
-        onConnect(host, port, code, cmdAsCtrl)
+        onConnect(relay.map { .relay($0) } ?? .direct(host: host, port: port), code, cmdAsCtrl)
     }
 }
 
@@ -163,14 +181,14 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
     var onClosed: (() -> Void)?
     private var didSizeWindow = false
 
-    init(host: String, port: UInt16, pairingCode: PairingCode?, commandAsControl: Bool) {
-        client = ViewerClient(host: host, port: port, pairingCode: pairingCode)
+    init(endpoint: ViewerConnector.Endpoint, expectedHostKey: [UInt8]?, pairingCode: PairingCode?, commandAsControl: Bool) {
+        client = ViewerClient(endpoint: endpoint, expectedHostKey: expectedHostKey, pairingCode: pairingCode)
         remoteView = RemoteView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
         remoteView.commandAsControl = commandAsControl
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = "\(host):\(port) — 接続中…"
+        window.title = "\(client.label) — 接続中…"
         window.contentView = remoteView
         window.isReleasedWhenClosed = false
         window.acceptsMouseMovedEvents = true
@@ -212,6 +230,7 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
 
     private func handleConnected() {
         guard let s = client.session, let window = window else { return }
+        UserDefaults.standard.set(Fingerprint.hex(s.hostPublicKey), forKey: "lastHostKey")
         window.subtitle = "🔒 暗号化・相互認証済み  ホスト指紋 \(s.hostFingerprint)"
         if s.newlyPaired {
             let a = NSAlert()
@@ -223,7 +242,7 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
 
     private func handleHello(width: Int, height: Int) {
         remoteView.remoteSize = CGSize(width: width, height: height)
-        window?.title = "\(client.host):\(client.port) — \(width)x\(height)"
+        window?.title = "\(client.label) — \(width)x\(height)"
         window?.contentAspectRatio = NSSize(width: width, height: height)
         if !didSizeWindow, let screen = window?.screen ?? NSScreen.main {
             didSizeWindow = true
@@ -236,7 +255,7 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
 
     private func handleDisconnect(_ error: Error?) {
         guard let window = window, window.isVisible else { return }
-        window.title = "\(client.host):\(client.port) — 切断"
+        window.title = "\(client.label) — 切断"
         remoteView.releaseAllKeys()
         let alert = NSAlert()
         alert.messageText = "接続が終了しました"

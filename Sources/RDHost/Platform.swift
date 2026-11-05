@@ -20,4 +20,6 @@ protocol InputInjector: AnyObject {
     func wheel(dx: Int32, dy: Int32)
     /// code: スキャンコード (拡張キーは 0xE000 を OR) または仮想キーコード
     func key(code: UInt16, down: Bool, virtualKey: Bool)
+    /// 文字列をそのまま入力する (キー配列に依存しない)
+    func text(_ s: String)
 }

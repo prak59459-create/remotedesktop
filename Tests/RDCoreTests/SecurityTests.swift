@@ -1,4 +1,8 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
 import Crypto
+#endif
 import Foundation
 import XCTest
 @testable import RDCore
@@ -228,7 +232,7 @@ final class SecurityTests: XCTestCase {
         let hostIdentity: StaticIdentity
     }
 
-    private func startHost() throws -> Env {
+    private func startHost(streaming: Bool = false) throws -> Env {
         let id = StaticIdentity.generate()
         let gate = HostGatekeeper(identity: id, clients: try TrustStore(fileName: "authorized_devices.json"),
                                   audit: AuditLog())
@@ -240,8 +244,14 @@ final class SecurityTests: XCTestCase {
                 guard let c = try? listener.accept() else { return }
                 Thread {
                     guard let client = try? gate.authenticate(c) else { return }
-                    // 認証できたら hello を 1 つ送る
-                    try? client.channel.send(.hello, Hello(width: 1, height: 1).encode())
+                    // 認証できたら hello を送る (streaming なら、実際の画面配信のように切れるまで送り続ける)
+                    repeat {
+                        do {
+                            try client.channel.send(.hello, Hello(width: 1, height: 1).encode())
+                        } catch {
+                            return
+                        }
+                    } while streaming
                 }.start()
             }
         }.start()
@@ -314,6 +324,99 @@ final class SecurityTests: XCTestCase {
         XCTAssertEqual(try other.remove(matching: String(fp.prefix(9))), 1)
         XCTAssertFalse(env.gate.isStillAuthorized(viewer.publicKey))
         XCTAssertThrowsError(try viewerConnect(env, viewer: viewer, code: nil, known: known))
+    }
+
+    /// 回帰テスト: 接続を素早く繰り返しても、閉じたソケットの番号が再利用されて
+    /// 前のセッションのデータが次の接続に混ざらないこと (use-after-close)
+    func testRapidReconnectsDoNotCrossTalk() throws {
+        let env = try startHost(streaming: true)
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        try env.gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        try known.add(publicKey: env.hostIdentity.publicKey, name: "h")
+        for i in 0 ..< 60 {
+            let s = try viewerConnect(env, viewer: viewer, code: nil, known: known)
+            for _ in 0 ..< 3 {
+                let (t, _) = try s.channel.receive() // 他のセッションのデータが混ざると復号に失敗して例外
+                XCTAssertEqual(t, MessageType.hello.rawValue, "iteration \(i)")
+            }
+            s.channel.close()
+        }
+    }
+
+    /// 中継サーバー (relay/server.js) を起動して、中継経由の接続全体を確かめる。Node が無ければ skip。
+    func testRelayEndToEnd() throws {
+        let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let script = repo.appendingPathComponent("relay/server.js")
+        guard FileManager.default.fileExists(atPath: repo.appendingPathComponent("relay/node_modules/ws").path),
+              let node = ["/usr/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"]
+                .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("node または relay/node_modules が無いので skip")
+        }
+        let relayPort = port()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: node)
+        proc.arguments = [script.path]
+        proc.environment = ["PORT": String(relayPort)]
+        proc.standardOutput = FileHandle.nullDevice
+        try proc.run()
+        defer { proc.terminate() }
+        Thread.sleep(forTimeInterval: 0.7)
+        let relayURL = URL(string: "ws://127.0.0.1:\(relayPort)")!
+
+        let hostID = StaticIdentity.generate()
+        let gate = HostGatekeeper(identity: hostID, clients: try TrustStore(fileName: "authorized_devices.json"),
+                                  audit: AuditLog())
+        let listener = RelayHostListener(relay: relayURL, hostPublicKey: hostID.publicKey) { _ in }
+        defer { listener.stop() }
+        Thread {
+            listener.run { transport in
+                guard let client = try? gate.authenticate(transport) else { return }
+                while (try? client.channel.send(.hello, Hello(width: 1, height: 1).encode())) != nil {}
+            }
+        }.start()
+        Thread.sleep(forTimeInterval: 0.7)
+
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        // 中継経由のペアリングは既定で拒否 (LAN 限定)
+        let window = gate.startPairing()
+        XCTAssertThrowsError(try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
+                                                         pairingCode: window.code, deviceName: "v")) { e in
+            guard case AuthError.rejected(.pairingFailed, _) = e else { return XCTFail("\(e)") }
+        }
+        gate.limiter.recordSuccess("relay:127.0.0.1")
+
+        // 登録済みなら、保存したホスト鍵だけを頼りに何度でも接続できる (セッション間の混線もない)
+        try gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        for i in 0 ..< 25 {
+            let s = try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
+                                                expectedHostKey: hostID.publicKey, pairingCode: nil, deviceName: "v")
+            for _ in 0 ..< 3 {
+                XCTAssertEqual(try s.channel.receive().type, MessageType.hello.rawValue, "iteration \(i)")
+            }
+            s.channel.close()
+        }
+
+        // 別のホスト鍵を期待して接続すると (部屋が違うので) つながらない
+        XCTAssertThrowsError(try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
+                                                         expectedHostKey: StaticIdentity.generate().publicKey,
+                                                         pairingCode: nil, deviceName: "v"))
+    }
+
+    func testPairingIsLANOnlyByDefault() {
+        XCTAssertTrue(isPrivateIPv4("192.168.1.20"))
+        XCTAssertTrue(isPrivateIPv4("10.0.0.1"))
+        XCTAssertTrue(isPrivateIPv4("172.20.3.4"))
+        XCTAssertFalse(isPrivateIPv4("172.32.0.1"))
+        XCTAssertFalse(isPrivateIPv4("8.8.8.8"))
+        XCTAssertFalse(isPrivateIPv4("relay:1.2.3.4"))
+        XCTAssertEqual(RelayRoom.id(hostPublicKey: [UInt8](repeating: 1, count: 32)).count, 26)
+        let k = StaticIdentity.generate().publicKey
+        let code = PairingCode(hostPublicKey: k)
+        // ペアリングコードからもホスト鍵からも同じ部屋 ID になる
+        XCTAssertEqual(RelayRoom.id(fingerprintPrefix: code.hostFingerprintPrefix), RelayRoom.id(hostPublicKey: k))
     }
 
     func testWrongPairingCodeIsRateLimited() throws {

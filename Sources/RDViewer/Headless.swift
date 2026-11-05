@@ -3,11 +3,14 @@ import RDCore
 
 /// GUI なしで接続し、受信状況を表示する (動作確認用・Linux 用)
 ///   RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]
+///   RDViewer --headless --relay URL [--pair CODE | --host 指紋の先頭] [--frames N]
 func runHeadless(_ arguments: [String]) -> Never {
     var positional: [String] = []
     var maxFrames = Int.max
     var outPath: String?
     var code: PairingCode?
+    var relay: URL?
+    var hostQuery: String?
     var it = arguments.makeIterator()
     while let a = it.next() {
         switch a {
@@ -15,6 +18,8 @@ func runHeadless(_ arguments: [String]) -> Never {
         case "--frames": maxFrames = it.next().flatMap { Int($0) } ?? maxFrames
         case "--out": outPath = it.next()
         case "--data-dir": DataDirectory.overridePath = it.next()
+        case "--relay": relay = it.next().flatMap(URL.init(string:))
+        case "--host": hostQuery = it.next()
         case "--pair":
             guard let c = it.next().flatMap(PairingCode.parse) else {
                 print("ペアリングコードの形式が正しくありません")
@@ -24,13 +29,34 @@ func runHeadless(_ arguments: [String]) -> Never {
         default: positional.append(a)
         }
     }
-    guard let host = positional.first else {
-        print("使い方: RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]")
-        exit(1)
+    let client: ViewerClient
+    if let relay = relay {
+        // 中継: 初回はペアリングコードから、2 回目以降は保存済みホストの鍵から部屋を決める
+        var key: [UInt8]?
+        if code == nil {
+            let hosts = (try? TrustStore(fileName: "trusted_hosts.json"))?.all ?? []
+            let q = (hostQuery ?? "").uppercased().replacingOccurrences(of: "-", with: "")
+            let matches = hosts.filter { e in
+                guard let k = Fingerprint.fromHex(e.publicKey) else { return false }
+                return q.isEmpty || Fingerprint.display(k).replacingOccurrences(of: "-", with: "").hasPrefix(q)
+            }
+            guard matches.count == 1, let k = Fingerprint.fromHex(matches[0].publicKey) else {
+                print(matches.isEmpty ? "信頼済みのホストがありません。--pair でペアリングしてください"
+                                      : "ホストが複数あります。--host で指紋の先頭を指定してください")
+                exit(1)
+            }
+            key = k
+        }
+        client = ViewerClient(endpoint: .relay(relay), expectedHostKey: key, pairingCode: code)
+    } else {
+        guard let host = positional.first else {
+            print("使い方: RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]")
+            print("       RDViewer --headless --relay URL [--pair CODE | --host 指紋] [--frames N]")
+            exit(1)
+        }
+        let port = positional.count > 1 ? UInt16(positional[1]) ?? defaultPort : defaultPort
+        client = ViewerClient(host: host, port: port, pairingCode: code)
     }
-    let port = positional.count > 1 ? UInt16(positional[1]) ?? defaultPort : defaultPort
-
-    let client = ViewerClient(host: host, port: port, pairingCode: code)
     let done = DispatchSemaphore(value: 0)
     let start = Date()
     client.onHello = { w, h in print("hello: \(w)x\(h)") }
@@ -44,6 +70,7 @@ func runHeadless(_ arguments: [String]) -> Never {
             client.send(.mouseWheel(dx: 0, dy: 120))
             client.send(.key(code: 0x1E, down: true, virtualKey: false))
             client.send(.key(code: 0x1E, down: false, virtualKey: false))
+            client.send(.text("こんにちは"))
         }
         if n % 30 == 0 || n == maxFrames {
             let t = Date().timeIntervalSince(start)
@@ -63,7 +90,7 @@ func runHeadless(_ arguments: [String]) -> Never {
         exit(1)
     }
     if let s = client.session {
-        print("接続しました (暗号化・相互認証済み): \(host):\(port)  ホストの指紋: \(s.hostFingerprint)\(s.newlyPaired ? "  [新規ペアリング]" : "")")
+        print("接続しました (暗号化・相互認証済み): \(client.label)  ホストの指紋: \(s.hostFingerprint)\(s.newlyPaired ? "  [新規ペアリング]" : "")")
     }
     done.wait()
     if let path = outPath { writePPM(client.framebuffer, to: path) }
