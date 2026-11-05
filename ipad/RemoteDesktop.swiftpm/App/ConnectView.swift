@@ -87,6 +87,10 @@ struct ConnectView: View {
             .navigationTitle("リモートデスクトップ")
         }
         .navigationViewStyle(.stack)
+        #if RD_SCREENSHOTS
+        .onReceive(ScreenshotDriver.shared.pairingCode) { pairingCode = $0 }
+        .onReceive(ScreenshotDriver.shared.pressConnect) { connect() }
+        #endif
     }
 
     private func connect() {

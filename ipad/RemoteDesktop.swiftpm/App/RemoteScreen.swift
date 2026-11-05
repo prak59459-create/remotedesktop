@@ -32,6 +32,13 @@ struct RemoteScreenContainer: View {
                 .toolbar { Button("閉じる") { showText = false } }
             }
         }
+        #if RD_SCREENSHOTS
+        .onReceive(ScreenshotDriver.shared.showTextSheet) { t in
+            text = t
+            showText = !t.isEmpty
+        }
+        .onReceive(ScreenshotDriver.shared.toggleKeyboard) { controller.toggleKeyboard() }
+        #endif
     }
 
     private func sendText() {

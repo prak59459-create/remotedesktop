@@ -1,0 +1,30 @@
+name: iPad screenshots
+
+# iPad アプリをシミュレーターで実際に動かし、テスト用ホストに接続して画面を撮る
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "ipad/**"
+      - "scripts/ipad-screenshots.sh"
+      - ".github/workflows/ipad-screenshots.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Take screenshots
+        run: ./scripts/ipad-screenshots.sh screenshots
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: ipad-screenshots
+          path: screenshots
+          retention-days: 14
