@@ -9,7 +9,6 @@ import XCTest
 
 final class SecurityTests: XCTestCase {
     private var tmpDir: URL!
-    private static var nextPort: UInt16 = 47200
 
     override func setUp() {
         tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("rdtest-\(UUID().uuidString)")
@@ -21,9 +20,10 @@ final class SecurityTests: XCTestCase {
         DataDirectory.overridePath = nil
     }
 
+    /// OS に空きポートを選ばせる (固定番号は外向き接続の一時ポートと衝突しうる)
     private func port() -> UInt16 {
-        Self.nextPort += 1
-        return Self.nextPort
+        let l = try! TCPListener(port: 0, bindAddress: "127.0.0.1")
+        return l.boundPort
     }
 
     // MARK: Noise
@@ -239,8 +239,8 @@ final class SecurityTests: XCTestCase {
                                   audit: AuditLog())
         gate.handshakeTimeout = 3
         gate.newDeviceConsent = newDeviceConsent
-        let p = port()
-        let listener = try TCPListener(port: p, bindAddress: "127.0.0.1")
+        let listener = try TCPListener(port: 0, bindAddress: "127.0.0.1")
+        let p = listener.boundPort
         Thread {
             while true {
                 guard let c = try? listener.accept() else { return }

@@ -64,7 +64,8 @@ final class RDCoreTests: XCTestCase {
     }
 
     func testLoopbackSocket() throws {
-        let listener = try TCPListener(port: 47123)
+        let listener = try TCPListener(port: 0, bindAddress: "127.0.0.1")
+        let p = listener.boundPort
         let done = expectation(description: "recv")
         Thread {
             let c = try! listener.accept()
@@ -74,7 +75,7 @@ final class RDCoreTests: XCTestCase {
             XCTAssertEqual(try! ClientEvent.decode(type: t, payload: p), .mouseMove(x: 3, y: 4))
             done.fulfill()
         }.start()
-        let ch = MessageChannel(try TCPConnection.open(host: "127.0.0.1", port: 47123))
+        let ch = MessageChannel(try TCPConnection.open(host: "127.0.0.1", port: p))
         try ch.send(.mouseMove(x: 3, y: 4))
         wait(for: [done], timeout: 5)
     }

@@ -281,6 +281,20 @@ public final class TCPListener {
 
     deinit { rawClose(fd) }
 
+    /// 実際に待ち受けているポート (port 0 で OS に選ばせたとき用)
+    public var boundPort: UInt16 {
+        var addr = sockaddr_in()
+        #if os(Windows)
+        var len = Int32(MemoryLayout<sockaddr_in>.size)
+        #else
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        #endif
+        let ok = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        return ok == 0 ? UInt16(bigEndian: addr.sin_port) : port
+    }
+
     public func accept() throws -> TCPConnection {
         #if os(Windows)
         var addr = sockaddr_in()
