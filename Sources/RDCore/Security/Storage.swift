@@ -6,6 +6,7 @@ import Crypto
 #endif
 
 #if os(Windows)
+import CWinSys
 import WinSDK
 #elseif canImport(Glibc)
 import Glibc
@@ -141,7 +142,7 @@ public enum SecretStore {
         let url = try DataDirectory.url().appendingPathComponent(fileName(name))
         guard let data = SecureFile.read(url) else { return nil }
         #if os(Windows)
-        return try dpapi(data, protect: false)
+        return try TPMWrap.unwrap(try dpapi(data, protect: false))
         #else
         return data
         #endif
@@ -153,7 +154,8 @@ public enum SecretStore {
         #endif
         let url = try DataDirectory.url().appendingPathComponent(fileName(name))
         #if os(Windows)
-        try SecureFile.write(try dpapi(bytes, protect: true), to: url)
+        // TPM があれば TPM 内の鍵で包んでから DPAPI。どちらか片方だけでは取り出せない
+        try SecureFile.write(try dpapi(TPMWrap.wrap(bytes), protect: true), to: url)
         #else
         try SecureFile.write(bytes, to: url)
         #endif
@@ -226,6 +228,83 @@ public enum SecretStore {
 }
 
 #if os(Windows)
+/// TPM 2.0 (Microsoft Platform Crypto Provider) の取り出せない RSA 鍵で秘密を包む。
+/// ディスクの中身を丸ごと別の PC に持ち出しても、その PC の TPM が無いと開けない。
+/// TPM が使えない PC では包まずに返す (DPAPI だけで守る)。
+enum TPMWrap {
+    static let header: [UInt8] = Array("RDTPM1".utf8)
+    static let keyName = "RemoteDesktop.KeyWrap"
+    private static let lock = NSLock()
+
+    private static func w<T>(_ s: String, _ body: (UnsafePointer<UInt16>) -> T) -> T {
+        s.withCString(encodedAs: UTF16.self, body)
+    }
+
+    /// TPM の鍵を開く (無ければ作る)。使えなければ nil
+    private static func openKey(create: Bool) -> NCRYPT_KEY_HANDLE? {
+        var prov: NCRYPT_PROV_HANDLE = 0
+        guard w("Microsoft Platform Crypto Provider", { NCryptOpenStorageProvider(&prov, $0, 0) }) == 0 else { return nil }
+        defer { _ = NCryptFreeObject(prov) }
+        var key: NCRYPT_KEY_HANDLE = 0
+        if w(keyName, { NCryptOpenKey(prov, &key, $0, 0, 0) }) == 0 { return key }
+        guard create else { return nil }
+        guard w("RSA", { alg in w(keyName, { NCryptCreatePersistedKey(prov, &key, alg, $0, 0, 0) }) }) == 0 else { return nil }
+        var bits: DWORD = 2048
+        _ = withUnsafeMutableBytes(of: &bits) { b in
+            w("Length", { NCryptSetProperty(key, $0, b.baseAddress!.assumingMemoryBound(to: UInt8.self), 4, 0) })
+        }
+        guard NCryptFinalizeKey(key, 0) == 0 else {
+            _ = NCryptFreeObject(key)
+            return nil
+        }
+        return key
+    }
+
+    private static func crypt(_ key: NCRYPT_KEY_HANDLE, _ input: [UInt8], encrypt: Bool) -> [UInt8]? {
+        var src = input
+        return w("SHA256") { alg -> [UInt8]? in
+            var pad = BCRYPT_OAEP_PADDING_INFO(pszAlgId: alg, pbLabel: nil, cbLabel: 0)
+            let flags: DWORD = 0x4 // NCRYPT_PAD_OAEP_FLAG
+            var size: DWORD = 0
+            let st1 = src.withUnsafeMutableBufferPointer { s in
+                encrypt ? NCryptEncrypt(key, s.baseAddress, DWORD(s.count), &pad, nil, 0, &size, flags)
+                        : NCryptDecrypt(key, s.baseAddress, DWORD(s.count), &pad, nil, 0, &size, flags)
+            }
+            guard st1 == 0, size > 0 else { return nil }
+            var out = [UInt8](repeating: 0, count: Int(size))
+            let st2 = src.withUnsafeMutableBufferPointer { s in
+                out.withUnsafeMutableBufferPointer { o in
+                    encrypt ? NCryptEncrypt(key, s.baseAddress, DWORD(s.count), &pad, o.baseAddress, DWORD(o.count), &size, flags)
+                            : NCryptDecrypt(key, s.baseAddress, DWORD(s.count), &pad, o.baseAddress, DWORD(o.count), &size, flags)
+                }
+            }
+            guard st2 == 0 else { return nil }
+            return Array(out.prefix(Int(size)))
+        }
+    }
+
+    static func wrap(_ secret: [UInt8]) -> [UInt8] {
+        lock.lock(); defer { lock.unlock() }
+        guard secret.count <= 190, let key = openKey(create: true) else { return secret }
+        defer { _ = NCryptFreeObject(key) }
+        guard let sealed = crypt(key, secret, encrypt: true) else { return secret }
+        return header + sealed
+    }
+
+    static func unwrap(_ blob: [UInt8]) throws -> [UInt8] {
+        guard blob.starts(with: header) else { return blob } // TPM なしで保存したもの
+        lock.lock(); defer { lock.unlock() }
+        guard let key = openKey(create: false) else {
+            throw StorageError.platform("TPM の鍵が見つかりません (別の PC にコピーされた可能性があります)")
+        }
+        defer { _ = NCryptFreeObject(key) }
+        guard let plain = crypt(key, Array(blob.dropFirst(header.count)), encrypt: false) else {
+            throw StorageError.platform("TPM で鍵を復号できません")
+        }
+        return plain
+    }
+}
+
 @inline(never)
 private func SecureZeroMemory(_ p: UnsafeMutablePointer<UInt8>, _ n: Int) {
     for i in 0 ..< n { p[i] = 0 }

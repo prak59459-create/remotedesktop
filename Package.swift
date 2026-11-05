@@ -20,22 +20,25 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "CWinHTTP",
+            name: "CWinSys",
             linkerSettings: [
                 .linkedLibrary("Winhttp", .when(platforms: [.windows])),
+                .linkedLibrary("ncrypt", .when(platforms: [.windows])),
             ]
         ),
         .target(
             name: "RDCore",
             dependencies: [
                 .product(name: "Crypto", package: "swift-crypto"),
-                .target(name: "CWinHTTP", condition: .when(platforms: [.windows])),
+                .target(name: "CWinSys", condition: .when(platforms: [.windows])),
             ],
             linkerSettings: [
                 .linkedLibrary("Ws2_32", .when(platforms: [.windows])),
                 .linkedLibrary("Crypt32", .when(platforms: [.windows])),
                 .linkedLibrary("Winhttp", .when(platforms: [.windows])),
+                .linkedLibrary("ncrypt", .when(platforms: [.windows])),
                 .linkedFramework("Security", .when(platforms: [.macOS])),
+                .linkedFramework("LocalAuthentication", .when(platforms: [.macOS])),
             ]
         ),
         .executableTarget(
@@ -50,6 +53,16 @@ let package = Package(
         .executableTarget(
             name: "RDViewer",
             dependencies: ["RDCore"]
+        ),
+        // libFuzzer 用 (scripts/fuzz.sh)。通常のビルドでは何もしない実行ファイル
+        .target(name: "CFuzzMain"),
+        .executableTarget(
+            name: "RDFuzz",
+            dependencies: [
+                "RDCore",
+                .target(name: "CFuzzMain", condition: .when(platforms: [.linux])),
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         .testTarget(
             name: "RDCoreTests",

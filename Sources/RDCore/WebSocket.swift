@@ -8,7 +8,7 @@ import Crypto
 import FoundationNetworking
 #endif
 #if os(Windows)
-import CWinHTTP
+import CWinSys
 import WinSDK
 #endif
 
@@ -129,33 +129,51 @@ final class PlainWebSocket: WebSocketConnection {
     }
 
     func receive() throws -> WebSocketMessage {
+        do {
+            return try Self.readMessage(next: { try tcp.receive(exactly: $0) },
+                                        control: { op, payload in try sendFrame(opcode: op, payload) })
+        } catch NetError.closed {
+            tcp.close()
+            throw NetError.closed
+        }
+    }
+
+    /// サーバーから届くフレームを 1 メッセージ分読む (ファジング対象の純粋な解析部分)。
+    /// next(n) は n バイトを返す。control は ping への pong や close の返送に使う。
+    static func readMessage(next: (Int) throws -> [UInt8],
+                            control: (UInt8, [UInt8]) throws -> Void) throws -> WebSocketMessage {
         var buffer: [UInt8] = []
         var messageOpcode: UInt8 = 0
         while true {
-            let h = try tcp.receive(exactly: 2)
+            let h = try next(2)
             let fin = h[0] & 0x80 != 0
             let opcode = h[0] & 0x0F
+            guard h[0] & 0x70 == 0 else { throw WebSocketError.protocolViolation("予約ビットが立っています") }
             guard h[1] & 0x80 == 0 else { throw WebSocketError.protocolViolation("サーバーからのフレームがマスクされています") }
             var len = UInt64(h[1] & 0x7F)
             if len == 126 {
-                let e = try tcp.receive(exactly: 2)
+                let e = try next(2)
                 len = UInt64(e[0]) << 8 | UInt64(e[1])
             } else if len == 127 {
-                let e = try tcp.receive(exactly: 8)
+                let e = try next(8)
                 len = e.reduce(0) { $0 << 8 | UInt64($1) }
             }
             guard len <= UInt64(WebSocketClient.maxMessageSize),
                   buffer.count + Int(len) <= WebSocketClient.maxMessageSize else {
                 throw WebSocketError.protocolViolation("メッセージが大きすぎます")
             }
-            let payload = len > 0 ? try tcp.receive(exactly: Int(len)) : []
+            let isControl = opcode & 0x8 != 0
+            if isControl {
+                // 制御フレームは分割禁止・125 バイトまで (RFC 6455 5.5)
+                guard fin, len <= 125 else { throw WebSocketError.protocolViolation("不正な制御フレーム") }
+            }
+            let payload = len > 0 ? try next(Int(len)) : []
             switch opcode {
             case 0x8: // close
-                try? sendFrame(opcode: 0x8, Array(payload.prefix(2)))
-                tcp.close()
+                try? control(0x8, Array(payload.prefix(2)))
                 throw NetError.closed
             case 0x9: // ping
-                try sendFrame(opcode: 0xA, payload)
+                try control(0xA, payload)
                 continue
             case 0xA: // pong
                 continue
@@ -353,3 +371,16 @@ final class WinHTTPWebSocket: WebSocketConnection {
     }
 }
 #endif
+
+/// ファジング用の入口 (RDFuzz から使う)
+public enum PlainWebSocketFuzz {
+    public static func read(_ data: [UInt8], _ offset: inout Int) throws -> WebSocketMessage {
+        var off = offset
+        defer { offset = off }
+        return try PlainWebSocket.readMessage(next: { n in
+            guard n >= 0, data.count - off >= n else { throw NetError.closed }
+            defer { off += n }
+            return Array(data[off ..< off + n])
+        }, control: { _, _ in })
+    }
+}

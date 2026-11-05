@@ -49,7 +49,7 @@ struct RemoteScreenContainer: View {
             Button("Win") { controller.tap([.scancode(0xE05B)]) }
             Button("Alt+Tab") { controller.tap([.scancode(0x38), .scancode(0x0F)]) }
             Spacer()
-            Text("🔒").help(session.hostFingerprint)
+            Text("🔒").help("\(session.securitySummary)\n\(session.hostFingerprint)")
             Button(role: .destructive) { session.disconnect() } label: { Image(systemName: "xmark.circle.fill") }
         }
         .font(.callout)

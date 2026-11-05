@@ -31,4 +31,10 @@ foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
 }
 
 Compress-Archive -Path "$dist\*" -DestinationPath "dist\RDHost-windows-x64.zip" -Force
+
+# 配布物のハッシュ (ダウンロードしたものと照合できるように)
+$sums = Get-ChildItem "$dist\*" , "dist\RDHost-windows-x64.zip" -File |
+    ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }
+$sums | Set-Content -Encoding ascii "dist\SHA256SUMS.txt"
+Get-Content "dist\SHA256SUMS.txt"
 Write-Host "完成: $dist\RDHost.exe / dist\RDHost-windows-x64.zip"

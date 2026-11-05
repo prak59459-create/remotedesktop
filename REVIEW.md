@@ -24,7 +24,12 @@
 | `Sources/RDCore/Relay.swift` | 中継経由の待ち受け | 中継サーバーからの制御メッセージを信用していないか |
 | `Sources/RDCore/Socket.swift` | ソケット | `close()` は shutdown のみ・解放は deinit（使用中の番号の再利用を防ぐ） |
 | `relay/server.js` | 中継サーバー | DoS 耐性、部屋の乗っ取り、セッション ID の扱い、`X-Forwarded-For` |
-| `Sources/RDHost/WindowsPlatform.swift` | GDI キャプチャ・SendInput・承認ダイアログ | |
+| `Sources/RDCore/Security/PostQuantum.swift` | ML-KEM-768 のハイブリッド鍵交換 | 鍵の混ぜ方、交渉のダウングレード耐性 |
+| `Sources/RDCore/Security/DeviceKeyProtection.swift` | iPad の Secure Enclave・Face ID | アクセス制御フラグ、フォールバック時の弱さ |
+| `Sources/RDCore/Security/Storage.swift`（TPMWrap・TrustStore・AuditLog） | TPM での鍵の保護、許可一覧の HMAC、監査ログのハッシュチェーン | 古い形式への差し替え、移行時の扱い |
+| `Sources/RDHost/WindowsPlatform.swift` | GDI キャプチャ・SendInput・承認ダイアログ・接続中の表示・画面消灯・権限確認・イベントログ | |
+| `Sources/RDFuzz/main.swift`, `scripts/fuzz.sh` | ファジングの対象範囲 | 抜けている解析部分がないか |
+| `.github/workflows/` | CI・出どころ証明・CodeQL | 権限の最小化、SHA 固定 |
 
 ## 既に分かっている設計上の割り切り
 
@@ -40,7 +45,8 @@ swift test
 cd relay && npm ci && npm test && npm audit
 ```
 
-- `swift test` には Noise の公式テストベクタ、改ざん検知、MITM 検知、ペアリングの使い捨て・回数制限・LAN 限定、失効、中継経由の通し試験（Node があれば）が含まれます。
+- `swift test` には Noise の公式テストベクタ、改ざん検知、MITM 検知、ペアリングの使い捨て・回数制限・LAN 限定・画面での許可、失効、耐量子の交渉、再鍵交換、許可一覧の改ざん検知、監査ログの検証、中継経由の通し試験（Node があれば）が含まれます。
+- `scripts/fuzz.sh 秒数` で libFuzzer + AddressSanitizer のファジング（Linux）。CI で毎回 5 分、毎晩 1 時間。
 - 手で試す場合は README の「動作確認」を見てください（Windows / Mac がなくても Linux でテストパターン配信できます）。
 
 ## 報告してほしい形式

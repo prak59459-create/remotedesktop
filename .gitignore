@@ -3,3 +3,6 @@
 dist/
 *.ppm
 node_modules/
+.build-fuzz/
+Fuzz/corpus/
+Fuzz/artifacts/

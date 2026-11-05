@@ -20,6 +20,7 @@ final class ViewerSession: ObservableObject {
     @Published var phase: Phase = .idle
     @Published var alert: AlertItem?
     @Published var hostFingerprint = ""
+    @Published var securitySummary = ""
     @Published var remoteSize = CGSize.zero
     @Published var commandAsControl = UserDefaults.standard.object(forKey: "cmdAsCtrl") as? Bool ?? true {
         didSet { UserDefaults.standard.set(commandAsControl, forKey: "cmdAsCtrl") }
@@ -58,7 +59,9 @@ final class ViewerSession: ObservableObject {
         }
         Thread { [weak self] in
             do {
-                let identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
+                // 端末鍵は Secure Enclave で包んであり、取り出すたびに Face ID が必要 (紛失・盗難対策)
+                let (identity, level) = try DeviceKeyProtection.loadOrCreateIdentity(
+                    name: "viewer_identity_v2", reason: "Windows PC に接続します")
                 let known = try TrustStore(fileName: "trusted_hosts.json")
                 let s = try ViewerConnector.connect(to: endpoint, identity: identity, knownHosts: known,
                                                     expectedHostKey: expected, pairingCode: pairingCode,
@@ -68,11 +71,12 @@ final class ViewerSession: ObservableObject {
                     Self.savedHostKey = s.hostPublicKey
                     self.channel = s.channel
                     self.hostFingerprint = s.hostFingerprint
+                    self.securitySummary = "\(s.isPostQuantum ? "耐量子暗号 (ML-KEM) + " : "")端末鍵: \(level.rawValue)"
                     self.phase = .connected
                     if s.newlyPaired {
                         self.alert = AlertItem(
                             title: "ペアリングしました",
-                            message: "ホストの指紋:\n\(s.hostFingerprint)\n\nWindows の画面に表示されている指紋と同じか確認してください。次回からはコードなしで接続できます。")
+                            message: "ホストの指紋:\n\(s.hostFingerprint)\n\nWindows の画面に表示されている指紋と同じか確認してください。次回からはコードなしで接続でき、外出先からは中継経由で接続できます。\n\n\(self.securitySummary)")
                     }
                 }
                 self?.receiveLoop(s.channel)

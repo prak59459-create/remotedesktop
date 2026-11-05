@@ -183,6 +183,7 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
 
     init(endpoint: ViewerConnector.Endpoint, expectedHostKey: [UInt8]?, pairingCode: PairingCode?, commandAsControl: Bool) {
         client = ViewerClient(endpoint: endpoint, expectedHostKey: expectedHostKey, pairingCode: pairingCode)
+        client.useDeviceKeyProtection = true
         remoteView = RemoteView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
         remoteView.commandAsControl = commandAsControl
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
@@ -231,7 +232,7 @@ final class SessionWindowController: NSWindowController, NSWindowDelegate {
     private func handleConnected() {
         guard let s = client.session, let window = window else { return }
         UserDefaults.standard.set(Fingerprint.hex(s.hostPublicKey), forKey: "lastHostKey")
-        window.subtitle = "🔒 暗号化・相互認証済み  ホスト指紋 \(s.hostFingerprint)"
+        window.subtitle = "🔒 暗号化・相互認証済み\(s.isPostQuantum ? " (耐量子)" : "")  ホスト指紋 \(s.hostFingerprint)"
         if s.newlyPaired {
             let a = NSAlert()
             a.messageText = "ペアリングしました"

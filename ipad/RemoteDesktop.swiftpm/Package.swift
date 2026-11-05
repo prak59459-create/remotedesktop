@@ -31,6 +31,7 @@ let package = Package(
             ],
             capabilities: [
                 .localNetwork(purposeString: "同じ Wi-Fi にある Windows PC に接続するために使います。"),
+                .faceID(purposeString: "PC に接続する前に、本人であることを確認します。"),
             ]
         ),
     ],

@@ -35,9 +35,25 @@ final class ViewerClient {
         self.init(endpoint: .direct(host: host, port: port), pairingCode: pairingCode)
     }
 
+    /// GUI では端末鍵を本人確認つきで取り出す (headless は自動テスト用なので使わない)
+    var useDeviceKeyProtection = false
+    private(set) var keyProtection = ""
+
     /// 接続・暗号化・相互認証 (ブロッキング) してから受信スレッドを起動する
     func connect() throws {
-        let identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
+        let identity: StaticIdentity
+        #if os(macOS)
+        if useDeviceKeyProtection {
+            let (id, level) = try DeviceKeyProtection.loadOrCreateIdentity(name: "viewer_identity_v2",
+                                                                            reason: "Windows PC に接続します")
+            identity = id
+            keyProtection = level.rawValue
+        } else {
+            identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
+        }
+        #else
+        identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
+        #endif
         let known = try TrustStore(fileName: "trusted_hosts.json")
         let s = try ViewerConnector.connect(to: endpoint, identity: identity, knownHosts: known,
                                             expectedHostKey: expectedHostKey, pairingCode: pairingCode,
