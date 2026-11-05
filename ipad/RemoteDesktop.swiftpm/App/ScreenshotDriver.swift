@@ -62,8 +62,10 @@ final class ScreenshotDriver: ObservableObject {
         await wait(1)
         await shot("04-connect-filled")
 
-        // 5. 接続 → ペアリング完了のお知らせ
+        // 5. 接続 → 本人確認 (CI が撮影後に Face ID の「一致」を送る) → ペアリング完了のお知らせ
         pressConnect.send()
+        await wait(2.5)
+        await shot("05-auth")
         guard await until(30, { session.phase == .connected }) else {
             await wait(1)
             await shot("99-connect-failed")
@@ -72,12 +74,12 @@ final class ScreenshotDriver: ObservableObject {
         }
         setOrientation(.landscapeRight)
         await wait(3)
-        await shot("05-paired")
+        await shot("06-paired")
         session.alert = nil
         await wait(2)
 
         // 6. リモート画面 (横向き)
-        await shot("06-remote-landscape")
+        await shot("07-remote-landscape")
 
         // 7. 入力が届くことの確認用に、マウスとキーを少し送る
         session.send(.mouseMove(x: 320, y: 200))
@@ -88,14 +90,14 @@ final class ScreenshotDriver: ObservableObject {
         // 8. 画面キーボード
         toggleKeyboard.send()
         await wait(2)
-        await shot("07-remote-keyboard")
+        await shot("08-remote-keyboard")
         toggleKeyboard.send()
         await wait(1)
 
         // 9. 日本語の文字入力
         showTextSheet.send("こんにちは、リモートデスクトップ")
         await wait(2)
-        await shot("08-text-input")
+        await shot("09-text-input")
         session.send(.text("こんにちは"))
         showTextSheet.send("")
         await wait(1)
@@ -103,12 +105,22 @@ final class ScreenshotDriver: ObservableObject {
         // 10. 縦向き
         setOrientation(.portrait)
         await wait(3)
-        await shot("09-remote-portrait")
+        await shot("10-remote-portrait")
 
         // 11. 切断後 (ペアリング済みのホストが表示される)
         session.disconnect()
         await wait(2)
-        await shot("10-after-disconnect")
+        await shot("11-after-disconnect")
+
+        // 12. 2 回目以降: コードなしで接続 (端末鍵を取り出すたびに本人確認)
+        pressConnect.send()
+        await wait(2.5)
+        await shot("12-reconnect-auth")
+        if await until(30, { session.phase == .connected }) {
+            await wait(3)
+            await shot("13-reconnected")
+            session.disconnect()
+        }
 
         try? Data().write(to: dir.appendingPathComponent("finished"))
     }

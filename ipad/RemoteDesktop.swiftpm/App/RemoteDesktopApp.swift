@@ -13,8 +13,13 @@ struct RemoteDesktopApp: App {
                     ConnectView(session: session)
                 }
             }
-            .alert(item: $session.alert) { a in
-                Alert(title: Text(a.title), message: Text(a.message), dismissButton: .default(Text("OK")))
+            .alert(session.alert?.title ?? "",
+                   isPresented: Binding(get: { session.alert != nil },
+                                        set: { if !$0 { session.alert = nil } }),
+                   presenting: session.alert) { _ in
+                Button("OK") {}
+            } message: { a in
+                Text(a.message)
             }
             #if RD_SCREENSHOTS
             .onAppear { Task { @MainActor in ScreenshotDriver.shared.start(session: session) } }

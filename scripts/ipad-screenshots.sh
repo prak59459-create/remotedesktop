@@ -57,6 +57,10 @@ APP="$(find "$WORK/dd/Build/Products" -maxdepth 2 -name 'RemoteDesktop.app' | he
 [ -n "$APP" ] || { echo "アプリが見つかりません"; exit 1; }
 xcrun simctl install "$UDID" "$APP"
 
+echo "== Face ID を登録済みにする (シミュレーターの機能。撮影後に「一致」を送って本人確認を通す)"
+xcrun simctl spawn "$UDID" notifyutil -s com.apple.BiometricKit.enrollmentChanged '1'
+xcrun simctl spawn "$UDID" notifyutil -p com.apple.BiometricKit.enrollmentChanged
+
 echo "== 起動して撮影"
 SIMCTL_CHILD_RD_SHOT_HOST="$IP" SIMCTL_CHILD_RD_SHOT_PORT=5999 SIMCTL_CHILD_RD_SHOT_CODE="$CODE" \
 SIMCTL_CHILD_RD_SHOT_RELAY="https://my-relay.onrender.com" \
@@ -72,6 +76,9 @@ while [ $SECONDS -lt $deadline ] && [ ! -f "$SHOTS/finished" ]; do
     sleep 0.5
     xcrun simctl io "$UDID" screenshot "$OUT/$n.png" >/dev/null
     echo "撮影: $n"
+    # 本人確認の画面が出ていれば、顔が一致したことにする (出ていなければ何も起きない)
+    xcrun simctl spawn "$UDID" notifyutil -p com.apple.BiometricKit_Sim.pearl.match || true
+    sleep 0.3
     touch "$SHOTS/$n.done"
   done
   sleep 0.5
@@ -81,4 +88,4 @@ sleep 1
 echo "== ホストが受け取った入力"
 grep -a '\[input\]' "$WORK/host.log" | tr -d '\r' | head -20 || true
 ls -1 "$OUT"
-[ -f "$OUT/06-remote-landscape.png" ] || { echo "リモート画面まで進めませんでした"; exit 1; }
+[ -f "$OUT/07-remote-landscape.png" ] || { echo "リモート画面まで進めませんでした"; exit 1; }
