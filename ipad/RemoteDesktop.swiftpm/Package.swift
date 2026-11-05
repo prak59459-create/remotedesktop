@@ -18,7 +18,6 @@ let package = Package(
             bundleIdentifier: "local.remotedesktop.viewer",
             displayVersion: "1.0",
             bundleVersion: "1",
-            appIcon: .placeholder(icon: .desktopcomputer),
             accentColor: .presetColor(.blue),
             supportedDeviceFamilies: [
                 .pad,
