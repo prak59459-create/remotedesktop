@@ -1,0 +1,135 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 既定は読み取りのみ。必要なジョブだけ権限を足す
+permissions:
+  contents: read
+
+# サードパーティの Action はタグではなくコミット SHA で固定する (タグの付け替えによる乗っ取り対策)
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write      # 出どころ証明 (Sigstore) の署名に使う
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: compnerd/gha-setup-swift@581df1ffa3f3e786ddc73ff37364ee231f9644c5 # v0.3.0
+        with:
+          branch: swift-6.3-release
+          tag: 6.3-RELEASE
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install relay deps (for the relay end-to-end test)
+        run: npm ci
+        working-directory: relay
+      - name: Build RDHost.exe
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Test (includes relay end-to-end over WinHTTP)
+        run: swift test
+      - name: Attest build provenance
+        # 同じリポジトリからの実行だけ (フォークの PR には署名権限を与えない)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/RDHost/RDHost.exe
+            dist/RDHost-windows-x64.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RDHost-windows-x64
+          path: |
+            dist/RDHost/
+            dist/SHA256SUMS.txt
+
+  macos-viewer:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: relay
+      - name: Build RDViewer
+        run: swift build -c release --product RDViewer
+      - name: Test (includes relay end-to-end over URLSession)
+        run: swift test
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "$(swift build -c release --show-bin-path)/RDViewer" dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RDViewer-macos
+          path: dist/
+
+  ipad-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Core/ is in sync with Sources/RDCore
+        run: |
+          ./scripts/sync-ipad.sh
+          git diff --exit-code -- ipad/
+      - name: Build iPad app (simulator, unsigned)
+        working-directory: ipad/RemoteDesktop.swiftpm
+        run: |
+          xcodebuild -list
+          xcodebuild build -scheme RemoteDesktop -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO
+
+  relay:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm audit --audit-level=moderate
+
+  linux:
+    runs-on: ubuntu-24.04
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: swift build
+      - run: swift test
+
+  fuzz:
+    # 攻撃者が送れるデータの解析部分を libFuzzer + AddressSanitizer で 5 分ずつ
+    runs-on: ubuntu-24.04
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: ./scripts/fuzz.sh 300
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-crash
+          path: Fuzz/artifacts/

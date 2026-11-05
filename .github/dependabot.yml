@@ -1,0 +1,15 @@
+# 依存ライブラリと GitHub Actions の更新・脆弱性修正を自動で PR にする
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /relay
+    schedule:
+      interval: weekly
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

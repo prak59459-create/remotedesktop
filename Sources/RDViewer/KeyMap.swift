@@ -1,0 +1,153 @@
+import RDCore
+
+/// macOS の仮想キーコード (kVK_*) → Windows へ送るキー
+enum RemoteKey: Equatable {
+    case scancode(UInt16) // PC/AT セット 1 (拡張キーは 0xE0xx)
+    case virtualKey(UInt16)
+}
+
+enum KeyMap {
+    static let leftCommand: UInt16 = 0x37
+    static let rightCommand: UInt16 = 0x36
+
+    /// commandAsControl: ⌘ を Ctrl として送る (false なら Windows キー)
+    static func remoteKey(forMacKeyCode code: UInt16, commandAsControl: Bool) -> RemoteKey? {
+        switch code {
+        case leftCommand: return .scancode(commandAsControl ? 0x1D : 0xE05B)
+        case rightCommand: return .scancode(commandAsControl ? 0xE01D : 0xE05C)
+        case 0x66: return .virtualKey(0x1A) // JIS 英数 → VK_IME_OFF
+        case 0x68: return .virtualKey(0x16) // JIS かな → VK_IME_ON
+        default: return table[code].map { .scancode($0) }
+        }
+    }
+
+    private static let table: [UInt16: UInt16] = [
+        0x00: 0x1E, // A
+        0x01: 0x1F, // S
+        0x02: 0x20, // D
+        0x03: 0x21, // F
+        0x04: 0x23, // H
+        0x05: 0x22, // G
+        0x06: 0x2C, // Z
+        0x07: 0x2D, // X
+        0x08: 0x2E, // C
+        0x09: 0x2F, // V
+        0x0A: 0x56, // ISO §
+        0x0B: 0x30, // B
+        0x0C: 0x10, // Q
+        0x0D: 0x11, // W
+        0x0E: 0x12, // E
+        0x0F: 0x13, // R
+        0x10: 0x15, // Y
+        0x11: 0x14, // T
+        0x12: 0x02, // 1
+        0x13: 0x03, // 2
+        0x14: 0x04, // 3
+        0x15: 0x05, // 4
+        0x16: 0x07, // 6
+        0x17: 0x06, // 5
+        0x18: 0x0D, // = (JIS: ^)
+        0x19: 0x0A, // 9
+        0x1A: 0x08, // 7
+        0x1B: 0x0C, // -
+        0x1C: 0x09, // 8
+        0x1D: 0x0B, // 0
+        0x1E: 0x1B, // ] (JIS: [)
+        0x1F: 0x18, // O
+        0x20: 0x16, // U
+        0x21: 0x1A, // [ (JIS: @)
+        0x22: 0x17, // I
+        0x23: 0x19, // P
+        0x24: 0x1C, // Return
+        0x25: 0x26, // L
+        0x26: 0x24, // J
+        0x27: 0x28, // ' (JIS: :)
+        0x28: 0x25, // K
+        0x29: 0x27, // ;
+        0x2A: 0x2B, // \ (JIS: ])
+        0x2B: 0x33, // ,
+        0x2C: 0x35, // /
+        0x2D: 0x31, // N
+        0x2E: 0x32, // M
+        0x2F: 0x34, // .
+        0x30: 0x0F, // Tab
+        0x31: 0x39, // Space
+        0x32: 0x29, // ` (半角/全角)
+        0x33: 0x0E, // Backspace
+        0x35: 0x01, // Escape
+        0x38: 0x2A, // Shift
+        0x39: 0x3A, // CapsLock
+        0x3A: 0x38, // Option → Alt
+        0x3B: 0x1D, // Control
+        0x3C: 0x36, // Right Shift
+        0x3D: 0xE038, // Right Option → Right Alt
+        0x3E: 0xE01D, // Right Control
+        0x41: 0x53, // Keypad .
+        0x43: 0x37, // Keypad *
+        0x45: 0x4E, // Keypad +
+        0x47: 0x45, // Keypad Clear → NumLock
+        0x4B: 0xE035, // Keypad /
+        0x4C: 0xE01C, // Keypad Enter
+        0x4E: 0x4A, // Keypad -
+        0x51: 0x59, // Keypad =
+        0x52: 0x52, // Keypad 0
+        0x53: 0x4F, // Keypad 1
+        0x54: 0x50, // Keypad 2
+        0x55: 0x51, // Keypad 3
+        0x56: 0x4B, // Keypad 4
+        0x57: 0x4C, // Keypad 5
+        0x58: 0x4D, // Keypad 6
+        0x59: 0x47, // Keypad 7
+        0x5B: 0x48, // Keypad 8
+        0x5C: 0x49, // Keypad 9
+        0x5D: 0x7D, // JIS ¥
+        0x5E: 0x73, // JIS _ (ろ)
+        0x5F: 0x7E, // JIS Keypad ,
+        0x60: 0x3F, // F5
+        0x61: 0x40, // F6
+        0x62: 0x41, // F7
+        0x63: 0x3D, // F3
+        0x64: 0x42, // F8
+        0x65: 0x43, // F9
+        0x67: 0x57, // F11
+        0x69: 0x64, // F13
+        0x6B: 0x65, // F14
+        0x6D: 0x44, // F10
+        0x6F: 0x58, // F12
+        0x71: 0x66, // F15
+        0x72: 0xE052, // Help → Insert
+        0x73: 0xE047, // Home
+        0x74: 0xE049, // Page Up
+        0x75: 0xE053, // Forward Delete
+        0x76: 0x3E, // F4
+        0x77: 0xE04F, // End
+        0x78: 0x3C, // F2
+        0x79: 0xE051, // Page Down
+        0x7A: 0x3B, // F1
+        0x7B: 0xE04B, // Left
+        0x7C: 0xE04D, // Right
+        0x7D: 0xE050, // Down
+        0x7E: 0xE048, // Up
+    ]
+
+    /// 修飾キーの keyCode と、NSEvent.modifierFlags の左右別ビット (NX_DEVICE*KEYMASK)
+    static let modifierDeviceMask: [UInt16: UInt] = [
+        0x3B: 0x0000_0001, // left control
+        0x38: 0x0000_0002, // left shift
+        0x3C: 0x0000_0004, // right shift
+        0x37: 0x0000_0008, // left command
+        0x36: 0x0000_0010, // right command
+        0x3A: 0x0000_0020, // left option
+        0x3D: 0x0000_0040, // right option
+        0x3E: 0x0000_2000, // right control
+    ]
+}
+
+extension RemoteKey {
+    func event(down: Bool) -> ClientEvent {
+        switch self {
+        case .scancode(let c): return .key(code: c, down: down, virtualKey: false)
+        case .virtualKey(let c): return .key(code: c, down: down, virtualKey: true)
+        }
+    }
+}

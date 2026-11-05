@@ -1,0 +1,17 @@
+{
+  "name": "remotedesktop-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end encrypted byte relay for RemoteDesktop (the relay cannot read traffic)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test --test-timeout=10000"
+  },
+  "dependencies": {
+    "ws": "8.22.1"
+  }
+}
