@@ -1,65 +1,76 @@
 # remotedesktop
 
-SwiftPM で作ったリモートデスクトップです。Mac から Windows の画面を見て操作します。
-通信はすべて**暗号化・相互認証**され、**ペアリングした端末だけ**が接続できます（詳細は [SECURITY.md](SECURITY.md)）。
+SwiftPM で作ったリモートデスクトップです。**iPad（または Mac）から Windows の画面を見て操作**します。
+通信はすべて**端末間で暗号化・相互認証**され、**ペアリングした端末だけ**が接続できます。外出先からは**ポート開放なしの中継サーバー経由**で使えます。
 
-| 実行ファイル | 動かす場所 | 役割 |
+| | 動かす場所 | 役割 |
 |---|---|---|
-| `RDHost.exe` | **Windows**（操作される側） | 画面キャプチャ (GDI) を配信し、受け取ったマウス・キーボード入力を `SendInput` で注入 |
-| `RDViewer` | **macOS**（操作する側） | 画面を表示し、マウス・キーボード・スクロールを送信 |
+| `RDHost.exe` | **Windows**（操作される側） | 画面キャプチャを配信し、受け取った入力を注入 |
+| `ipad/RemoteDesktop.swiftpm` | **iPad / iPhone**（操作する側） | Swift Playgrounds で開くアプリ |
+| `RDViewer` | **macOS**（操作する側） | Mac 用ビューア |
+| `relay/` | **無料の Render など** | 外出先用の中継サーバー（暗号文を受け渡すだけ） |
 
-## セキュリティの概要
+## セキュリティの概要（詳細は [SECURITY.md](SECURITY.md)、検査する人向けは [REVIEW.md](REVIEW.md)）
 
-- **Noise Protocol（`Noise_XX_25519_ChaChaPoly_SHA256`）**で暗号化と相互認証。平文で通信するモードはありません。
+- **Noise Protocol（`Noise_XX_25519_ChaChaPoly_SHA256`）**で暗号化と相互認証。平文モードなし。
 - **パスワードなし。** 端末ごとの鍵で認証し、ホストは登録済みの端末だけを受け入れます。
-- **ペアリングコード**にホストの指紋が入っているので、初回接続でもなりすましホスト（中間者攻撃）を自動で検出します。コードは 1 回限り・10 分で失効・5 回間違えると無効。
-- 秘密鍵は **Windows DPAPI / macOS キーチェーン**で保護。
-- 総当たり対策（IP ごとに指数的ブロック）、認証前の接続数・時間制限、接続時の承認ダイアログ（`--confirm`）、監査ログ、端末の失効（接続中のセッションも即切断）。
+- **ペアリングコード**にホストの指紋が入っているので、初回でもなりすましを自動で検出。コードは 1 回限り・10 分で失効・5 回間違えると無効。**登録は同じ Wi-Fi からだけ**。
+- **中継サーバーは中身を読めません。** ホストは外向きに接続するだけなので、自宅のルーターで**ポートを開ける必要がありません**。
+- 秘密鍵は Windows DPAPI / iPad・Mac のキーチェーンで保護。総当たり対策、接続時の承認ダイアログ（`--confirm`）、監査ログ、端末の失効（接続中も即切断）。
 
-> 第三者のセキュリティ監査は受けていません。限界は [SECURITY.md](SECURITY.md) の「既知の限界」を見てください。インターネットに直接公開せず、外から使うときは VPN などを併用してください。
+> 第三者のセキュリティ監査は受けていません。限界は SECURITY.md の「既知の限界」を見てください。
 
 ## 使い方
 
-### 1. Windows 側 (RDHost.exe)
+### 1. 中継サーバー（外出先から使う場合・最初に一度だけ）
 
-GitHub Actions の `build` ワークフローの成果物 **`RDHost-windows-x64`** をダウンロードします（`RDHost.exe` と Swift ランタイム DLL が同じフォルダに入っています。フォルダごと使ってください）。
+[Render](https://render.com) の無料プランで動かします。このリポジトリの `render.yaml`（Blueprint）からデプロイすると `https://<名前>.onrender.com` が中継サーバーの URL になります。
 
-自分でビルドする場合は [Swift for Windows](https://www.swift.org/install/windows/) を入れて:
+### 2. Windows 側 (RDHost.exe)
 
-```bash
-powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
-```
+GitHub Actions の `build` ワークフローの成果物 **`RDHost-windows-x64`** をダウンロードし、フォルダごと置きます（自分でビルドする場合は `scripts\build-windows.ps1`）。
 
-**初回（端末の登録）**は `--pair` 付きで起動します:
+**初回**は、iPad と同じ Wi-Fi で `--pair` 付きで起動します:
 
 ```bash
-RDHost.exe --pair
+RDHost.exe --pair --relay https://<名前>.onrender.com
 ```
 
-`ペアリングコード: XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` が表示されます（10 分間・1 回限り）。2 回目以降は `RDHost.exe` だけで起動できます。
+表示された**ペアリングコード**と、PC の IP アドレスを iPad に入力します。2 回目以降は `--pair` なしで起動します:
+
+```bash
+RDHost.exe --relay https://<名前>.onrender.com --confirm
+```
 
 | オプション | 説明 |
 |---|---|
-| `--pair` | 新しい端末を登録するためのコードを表示 |
+| `--pair` | 新しい端末を登録するためのコードを表示（同じ Wi-Fi からのみ登録可） |
+| `--relay URL` | 中継サーバー経由でも待ち受ける（ポート開放不要） |
+| `--no-direct` | 直接接続（TCP 5999）の待ち受けをしない |
 | `--confirm` | 接続のたびに Windows 側で許可/拒否のダイアログを出す |
-| `--bind 192.168.0.10` | 待ち受けるアドレスを限定（既定は全インターフェース） |
-| `--port 5999` / `--fps 30` / `--scale 2` | ポート、最大フレームレート、縮小率 |
-| `--list` / `--revoke ID` | 登録済み端末の一覧 / 取り消し（ID は指紋の先頭 4 文字以上） |
-| `--fingerprint` | このホストの指紋を表示 |
+| `--bind ADDR` / `--port N` / `--fps N` / `--scale N` | 待ち受けアドレス、ポート、最大フレームレート、縮小率 |
+| `--list` / `--revoke ID` / `--fingerprint` | 登録済み端末の一覧 / 取り消し / ホストの指紋 |
+| `--allow-remote-pairing` | LAN 外からの端末登録も許可（非推奨） |
 
-初回起動時に Windows ファイアウォールの確認が出たら「プライベートネットワーク」だけを許可してください。
+ポート開放は**不要**です（中継モード）。直接接続をインターネットに公開したい場合でも、ペアリングは LAN 内からしか受け付けません。
 
-### 2. Mac 側 (RDViewer)
+### 3. iPad 側
+
+1. このリポジトリの `ipad/RemoteDesktop.swiftpm` フォルダを iPad の「ファイル」に入れ（iCloud Drive など）、**Swift Playgrounds** で開いて実行します。
+2. **初回**: 「同じ Wi-Fi」を選び、PC の IP アドレスとペアリングコードを入力して「接続」。表示されたホストの指紋が Windows 側の表示と同じか確認します。
+3. **外出先**: 「外出先 (中継)」を選び、中継サーバーの URL を入力して「接続」。
+
+操作（トラックパッド方式）:
+- 1 本指で動かす: カーソル移動 / タップ: 左クリック / 2 本指タップ: 右クリック
+- 2 本指で上下: スクロール / 長押ししてから動かす: ドラッグ
+- マウスやトラックパッドを iPad につないだ場合はポインタに追従、右クリックも可
+- ハードウェアキーボードはそのまま使えます（⌘ は Ctrl として送る設定が既定）。⌨️ で画面キーボード、文字入力ボタンで日本語などを確定してまとめて送れます
+
+### 4. Mac 側（任意）
 
 ```bash
 swift run -c release RDViewer
 ```
-
-接続ダイアログに Windows の IP アドレスと、**初回だけ**ペアリングコードを入力して「接続」。ペアリング後に表示されるホストの指紋が、Windows 側に表示されている指紋と一致することを確認してください。2 回目以降はコード不要です。
-
-- ⌘ は既定で **Ctrl** として送ります（⌘C / ⌘V でコピー・貼り付け）。チェックを外すと Windows キーになります。
-- ⌘Q（終了）と ⌘N（新しい接続）は Mac 側で使います。メニュー「リモート」から Windows キー、Ctrl+Shift+Esc、Alt+Tab を送れます。
-- JIS キーボードの「英数」「かな」は IME オフ / オンとして送ります。キーは物理位置（スキャンコード）で送ります。
 
 ## 仕組み
 
@@ -67,9 +78,14 @@ swift run -c release RDViewer
 Sources/
   RDCore/
     Security/  Noise XX、暗号化ストリーム、ペアリング、認証、鍵の保管 (DPAPI / キーチェーン)
+    Relay / WebSocket / Transport   中継経由の接続 (URLSession / WinHTTP / 最小実装)
     ...        メッセージ、ソケット (Winsock / BSD)、タイル差分コーデック
   RDHost/      Windows: GDI キャプチャ + SendInput + 承認ダイアログ（Windows 以外ではテストパターン配信）
   RDViewer/    macOS: AppKit ビューア（--headless で GUI なしの受信テスト）
+ipad/RemoteDesktop.swiftpm/
+  App/         iPad アプリ (SwiftUI + UIKit)
+  Core/        Sources/RDCore のコピー (scripts/sync-ipad.sh で更新。直接編集しない)
+relay/         中継サーバー (Node.js + ws)
 ```
 
 - 画面を 64×64 のタイルに分け、変化したタイルだけを RLE（24bit 色）で送ります。
@@ -91,8 +107,21 @@ swift run -c release RDViewer --headless 127.0.0.1 6001 --pair <表示された�
 swift test
 ```
 
+中継経由も試す場合:
+
+```bash
+cd relay && npm ci && PORT=8099 node server.js
+```
+
+```bash
+swift run -c release RDHost --port 6001 --pair --relay ws://127.0.0.1:8099
+```
+
+（ペアリングは直接接続で行い、その後 `RDViewer --headless --relay ws://127.0.0.1:8099 --frames 90` で中継経由になります）
+
 ## 制限
 
 - プライマリモニタのみ。音声・クリップボード共有・ファイル転送なし。
 - ロック画面や UAC の確認画面は（Windows の仕様上）キャプチャ・操作できません。Ctrl+Alt+Del も送れません。
-- 圧縮は簡易 RLE なので、動画など変化の多い画面は帯域を多く使います（`--scale 2` で軽くなります）。
+- 圧縮は簡易 RLE なので、動画など変化の多い画面は帯域を多く使います（`--scale 2` や `--fps 15` で軽くなります）。無料の中継サーバーは月間の転送量に上限があります。
+- iPad アプリは Swift Playgrounds での実行を想定しています（App Store 配布はしていません）。

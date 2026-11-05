@@ -1,0 +1,16 @@
+# Render (https://render.com) の無料プランで中継サーバーを動かす設定
+services:
+  - type: web
+    name: remotedesktop-relay
+    runtime: node
+    plan: free
+    rootDir: relay
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: TRUST_PROXY
+        value: "1"
+      - key: NODE_ENV
+        value: production

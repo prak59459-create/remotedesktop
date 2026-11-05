@@ -349,8 +349,15 @@ final class SecurityTests: XCTestCase {
         let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let script = repo.appendingPathComponent("relay/server.js")
+        #if os(Windows)
+        let sep: Character = ";", exe = "node.exe"
+        #else
+        let sep: Character = ":", exe = "node"
+        #endif
+        let pathDirs = (ProcessInfo.processInfo.environment["PATH"] ?? ProcessInfo.processInfo.environment["Path"] ?? "")
+            .split(separator: sep).map(String.init) + ["/usr/local/bin", "/opt/homebrew/bin"]
         guard FileManager.default.fileExists(atPath: repo.appendingPathComponent("relay/node_modules/ws").path),
-              let node = ["/usr/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"]
+              let node = pathDirs.map({ URL(fileURLWithPath: $0).appendingPathComponent(exe).path })
                 .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
             throw XCTSkip("node または relay/node_modules が無いので skip")
         }

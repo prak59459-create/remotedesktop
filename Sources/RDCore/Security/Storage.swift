@@ -40,9 +40,12 @@ public enum DataDirectory {
             #if os(Windows)
             guard let base = env["LOCALAPPDATA"] else { throw StorageError.io("LOCALAPPDATA が未設定") }
             url = URL(fileURLWithPath: base, isDirectory: true).appendingPathComponent("RemoteDesktop", isDirectory: true)
-            #elseif os(macOS)
-            url = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/RemoteDesktop", isDirectory: true)
+            #elseif canImport(Darwin)
+            // macOS: ~/Library/Application Support/RemoteDesktop、iPadOS: アプリのサンドボックス内
+            guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                throw StorageError.io("Application Support が見つかりません")
+            }
+            url = base.appendingPathComponent("RemoteDesktop", isDirectory: true)
             #else
             let base = env["XDG_CONFIG_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
                 ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config", isDirectory: true)
@@ -97,7 +100,7 @@ public enum SecureFile {
 
 /// 秘密鍵の保管。
 ///   Windows: DPAPI (CryptProtectData) でユーザーのログオン資格情報に紐付けて暗号化してからファイルへ
-///   macOS:   キーチェーン (このデバイスのみ・ロック解除中のみ取り出し可)
+///   macOS / iPadOS: キーチェーン (このデバイスのみ・ロック解除中のみ取り出し可)
 ///   その他:  パーミッション 0600 のファイル
 public enum SecretStore {
     public static func loadOrCreateIdentity(name: String) throws -> StaticIdentity {
@@ -110,7 +113,7 @@ public enum SecretStore {
     }
 
     static var useKeychain: Bool {
-        #if os(macOS)
+        #if os(macOS) || os(iOS)
         return DataDirectory.overridePath == nil
         #else
         return false
@@ -118,7 +121,7 @@ public enum SecretStore {
     }
 
     public static func load(name: String) throws -> [UInt8]? {
-        #if os(macOS)
+        #if os(macOS) || os(iOS)
         if useKeychain { return try keychainLoad(name) }
         #endif
         let url = try DataDirectory.url().appendingPathComponent(fileName(name))
@@ -131,7 +134,7 @@ public enum SecretStore {
     }
 
     public static func save(name: String, bytes: [UInt8]) throws {
-        #if os(macOS)
+        #if os(macOS) || os(iOS)
         if useKeychain { return try keychainSave(name, bytes) }
         #endif
         let url = try DataDirectory.url().appendingPathComponent(fileName(name))
@@ -172,7 +175,7 @@ public enum SecretStore {
     }
     #endif
 
-    #if os(macOS)
+    #if os(macOS) || os(iOS)
     private static let service = "RemoteDesktop"
 
     private static func keychainLoad(_ name: String) throws -> [UInt8]? {

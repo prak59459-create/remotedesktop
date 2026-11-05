@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   windows-exe:
     runs-on: windows-latest
@@ -15,10 +18,16 @@ jobs:
         with:
           branch: swift-6.3-release
           tag: 6.3-RELEASE
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install relay deps (for the relay end-to-end test)
+        run: npm ci
+        working-directory: relay
       - name: Build RDHost.exe
         shell: pwsh
         run: ./scripts/build-windows.ps1
-      - name: Test
+      - name: Test (includes relay end-to-end over WinHTTP)
         run: swift test
       - uses: actions/upload-artifact@v4
         with:
@@ -29,9 +38,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: relay
       - name: Build RDViewer
         run: swift build -c release --product RDViewer
-      - name: Test
+      - name: Test (includes relay end-to-end over URLSession)
         run: swift test
       - name: Package
         run: |
@@ -41,6 +55,35 @@ jobs:
         with:
           name: RDViewer-macos
           path: dist/
+
+  ipad-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Core/ is in sync with Sources/RDCore
+        run: |
+          ./scripts/sync-ipad.sh
+          git diff --exit-code -- ipad/
+      - name: Build iPad app (simulator, unsigned)
+        working-directory: ipad/RemoteDesktop.swiftpm
+        run: |
+          xcodebuild -list
+          xcodebuild build -scheme RemoteDesktop -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO
+
+  relay:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm audit --audit-level=moderate
 
   linux:
     runs-on: ubuntu-24.04

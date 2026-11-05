@@ -45,7 +45,8 @@ const recentConns = new Map(); // ip -> timestamps (直近 1 分)
 function clientIP(req) {
   if (config.trustProxy) {
     const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.length > 0) return xff.split(',')[0].trim().slice(0, 64);
+    // 末尾 = 直前のプロキシ (Render) が付け足した値。先頭はクライアントが自由に書けるので使わない
+    if (typeof xff === 'string' && xff.length > 0) return xff.split(',').pop().trim().slice(0, 64);
   }
   return (req.socket.remoteAddress || 'unknown').slice(0, 64);
 }
