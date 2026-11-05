@@ -20,9 +20,16 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CWinHTTP",
+            linkerSettings: [
+                .linkedLibrary("Winhttp", .when(platforms: [.windows])),
+            ]
+        ),
+        .target(
             name: "RDCore",
             dependencies: [
                 .product(name: "Crypto", package: "swift-crypto"),
+                .target(name: "CWinHTTP", condition: .when(platforms: [.windows])),
             ],
             linkerSettings: [
                 .linkedLibrary("Ws2_32", .when(platforms: [.windows])),

@@ -8,6 +8,7 @@ import Crypto
 import FoundationNetworking
 #endif
 #if os(Windows)
+import CWinHTTP
 import WinSDK
 #endif
 
