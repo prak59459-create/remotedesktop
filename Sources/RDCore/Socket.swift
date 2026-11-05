@@ -114,15 +114,25 @@ public enum Net {
 
 // MARK: - TCP 接続
 
-public final class TCPConnection {
+/// 双方向のバイトストリーム (平文 TCP / 暗号化チャネル共通)
+public protocol ByteStream: AnyObject {
+    func sendAll(_ bytes: [UInt8]) throws
+    func receive(exactly n: Int) throws -> [UInt8]
+    func close()
+}
+
+public final class TCPConnection: ByteStream {
     private let fd: NativeSocket
     private let closeLock = NSLock()
     private var isClosed = false
     public let peerDescription: String
+    /// 相手の IP アドレス (ポートなし)。レート制限のキーに使う。
+    public let peerIP: String
 
-    init(fd: NativeSocket, peer: String) {
+    init(fd: NativeSocket, peer: String, peerIP: String? = nil) {
         self.fd = fd
         self.peerDescription = peer
+        self.peerIP = peerIP ?? peer
         setOpt(fd, kIPPROTO_TCP, kTCP_NODELAY, 1)
     }
 
@@ -190,6 +200,23 @@ public final class TCPConnection {
         return out
     }
 
+    /// 受信タイムアウト (秒)。0 で無効。認証前の接続を長く占有させないために使う。
+    public func setReceiveTimeout(_ seconds: Double) {
+        #if os(Windows)
+        var ms = DWORD(max(0, seconds) * 1000)
+        _ = withUnsafePointer(to: &ms) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 4) {
+                setsockopt(fd, 0xFFFF /* SOL_SOCKET */, 0x1006 /* SO_RCVTIMEO */, $0, Int32(MemoryLayout<DWORD>.size))
+            }
+        }
+        #else
+        var tv = timeval()
+        tv.tv_sec = Int(seconds)
+        tv.tv_usec = numericCast(Int((seconds - Double(Int(seconds))) * 1_000_000))
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        #endif
+    }
+
     public func close() {
         closeLock.lock()
         defer { closeLock.unlock() }
@@ -206,8 +233,8 @@ public final class TCPListener {
     private let fd: NativeSocket
     public let port: UInt16
 
-    /// 0.0.0.0:port で待ち受ける (IPv4)。
-    public init(port: UInt16) throws {
+    /// bindAddress:port で待ち受ける (IPv4)。bindAddress が nil なら全インターフェース。
+    public init(port: UInt16, bindAddress: String? = nil) throws {
         Net.initialize()
         self.port = port
         var hints = addrinfo()
@@ -216,7 +243,7 @@ public final class TCPListener {
         hints.ai_protocol = kIPPROTO_TCP
         hints.ai_flags = kAI_PASSIVE
         var result: UnsafeMutablePointer<addrinfo>? = nil
-        let rc = getaddrinfo(nil, String(port), &hints, &result)
+        let rc = getaddrinfo(bindAddress, String(port), &hints, &result)
         guard rc == 0, let ai = result else { throw NetError.resolve("port \(port) (code \(rc))") }
         defer { freeaddrinfo(ai) }
 
@@ -254,7 +281,7 @@ public final class TCPListener {
             }
         }
         guard c != invalidSocket else { throw NetError.io("accept (error \(lastErrorCode()))") }
-        return TCPConnection(fd: c, peer: describe(addr))
+        return TCPConnection(fd: c, peer: describe(addr), peerIP: describeIP(addr))
     }
 }
 
@@ -268,10 +295,12 @@ private func acceptConnection(_ s: NativeSocket, _ a: UnsafeMutablePointer<socka
 }
 #endif
 
+private func describeIP(_ addr: sockaddr_in) -> String {
+    // sin_addr はネットワークバイトオーダー
+    let b = withUnsafeBytes(of: addr.sin_addr) { Array($0.prefix(4)) }
+    return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
+}
+
 private func describe(_ addr: sockaddr_in) -> String {
-    // sin_addr / sin_port はネットワークバイトオーダー
-    let port = UInt16(bigEndian: addr.sin_port)
-    let ip: UInt32 = withUnsafeBytes(of: addr.sin_addr) { $0.load(as: UInt32.self) }
-    let b = withUnsafeBytes(of: ip) { Array($0) }
-    return "\(b[0]).\(b[1]).\(b[2]).\(b[3]):\(port)"
+    "\(describeIP(addr)):\(UInt16(bigEndian: addr.sin_port))"
 }

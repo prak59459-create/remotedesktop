@@ -2,27 +2,35 @@ import Foundation
 import RDCore
 
 /// GUI なしで接続し、受信状況を表示する (動作確認用・Linux 用)
-///   RDViewer --headless <host> [port] [--frames N] [--out screen.ppm]
+///   RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]
 func runHeadless(_ arguments: [String]) -> Never {
     var positional: [String] = []
     var maxFrames = Int.max
     var outPath: String?
+    var code: PairingCode?
     var it = arguments.makeIterator()
     while let a = it.next() {
         switch a {
         case "--headless": continue
         case "--frames": maxFrames = it.next().flatMap { Int($0) } ?? maxFrames
         case "--out": outPath = it.next()
+        case "--data-dir": DataDirectory.overridePath = it.next()
+        case "--pair":
+            guard let c = it.next().flatMap(PairingCode.parse) else {
+                print("ペアリングコードの形式が正しくありません")
+                exit(1)
+            }
+            code = c
         default: positional.append(a)
         }
     }
     guard let host = positional.first else {
-        print("使い方: RDViewer --headless <host> [port] [--frames N] [--out screen.ppm]")
+        print("使い方: RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]")
         exit(1)
     }
     let port = positional.count > 1 ? UInt16(positional[1]) ?? defaultPort : defaultPort
 
-    let client = ViewerClient(host: host, port: port)
+    let client = ViewerClient(host: host, port: port, pairingCode: code)
     let done = DispatchSemaphore(value: 0)
     let start = Date()
     client.onHello = { w, h in print("hello: \(w)x\(h)") }
@@ -54,7 +62,9 @@ func runHeadless(_ arguments: [String]) -> Never {
         print("エラー: \(error)")
         exit(1)
     }
-    print("接続しました: \(host):\(port)")
+    if let s = client.session {
+        print("接続しました (暗号化・相互認証済み): \(host):\(port)  ホストの指紋: \(s.hostFingerprint)\(s.newlyPaired ? "  [新規ペアリング]" : "")")
+    }
     done.wait()
     if let path = outPath { writePPM(client.framebuffer, to: path) }
     client.disconnect()

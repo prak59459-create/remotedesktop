@@ -3,10 +3,11 @@ import Foundation
 /// 既定のポート番号
 public let defaultPort: UInt16 = 5999
 
-/// hello メッセージ先頭のマジック ("SRD1")
-public let protocolMagic: UInt32 = 0x3144_5253
+/// hello メッセージ先頭のマジック
+public let protocolMagic: UInt32 = 0x3244_5253 // "SRD2" (暗号化必須版)
 
 /// メッセージ = [type: u8][length: u32 LE][payload: length bytes]
+/// (常に SecureStream = Noise 暗号化チャネルの上で送る)
 public enum MessageType: UInt8 {
     // ホスト → ビューア
     case hello = 1            // magic u32, width u32, height u32
@@ -19,6 +20,10 @@ public enum MessageType: UInt8 {
     case mouseWheel = 13      // dx i32, dy i32 (Windows の WHEEL_DELTA=120 単位)
     case key = 14             // code u16, flags u8
     case requestKeyframe = 15 // 全画面を送り直してもらう
+
+    // 認証 (暗号化チャネル確立後、画面配信の前)
+    case authRequest = 20     // AuthRequest
+    case authResult = 21      // AuthResult
 }
 
 public enum MouseButton: UInt8 {
@@ -108,29 +113,30 @@ public enum ClientEvent: Equatable {
             let code = try r.u16()
             let flags = try r.u8()
             return .key(code: code, down: flags & KeyFlag.down != 0, virtualKey: flags & KeyFlag.virtualKey != 0)
-        case .hello, .frame: return nil
+        case .hello, .frame, .authRequest, .authResult: return nil
         }
     }
 }
 
-/// TCP 上でメッセージを送受信する。send はスレッドセーフ。
+/// ByteStream 上でメッセージを送受信する。send はスレッドセーフ。
 public final class MessageChannel {
-    public let connection: TCPConnection
+    public let stream: ByteStream
     private let sendLock = NSLock()
-    public static let maxPayload = 256 * 1024 * 1024
+    public let maxPayload: Int
 
-    public init(_ connection: TCPConnection) {
-        self.connection = connection
+    public init(_ stream: ByteStream, maxPayload: Int = 64 * 1024 * 1024) {
+        self.stream = stream
+        self.maxPayload = maxPayload
     }
 
     public func send(_ type: MessageType, _ payload: [UInt8]) throws {
-        var header = ByteWriter(capacity: 5)
-        header.u8(type.rawValue)
-        header.u32(UInt32(payload.count))
+        var msg = ByteWriter(capacity: 5 + payload.count)
+        msg.u8(type.rawValue)
+        msg.u32(UInt32(payload.count))
+        msg.bytes.append(contentsOf: payload)
         sendLock.lock()
         defer { sendLock.unlock() }
-        try connection.sendAll(header.bytes)
-        if !payload.isEmpty { try connection.sendAll(payload) }
+        try stream.sendAll(msg.bytes)
     }
 
     public func send(_ event: ClientEvent) throws {
@@ -140,13 +146,13 @@ public final class MessageChannel {
 
     /// 1 メッセージ受信する (type は未知の値の可能性もあるので生の u8 で返す)
     public func receive() throws -> (type: UInt8, payload: [UInt8]) {
-        var r = ByteReader(try connection.receive(exactly: 5))
+        var r = ByteReader(try stream.receive(exactly: 5))
         let type = try r.u8()
         let len = Int(try r.u32())
-        guard len <= MessageChannel.maxPayload else { throw ProtocolError.invalid("payload が大きすぎます (\(len))") }
-        let payload = len > 0 ? try connection.receive(exactly: len) : []
+        guard len <= maxPayload else { throw ProtocolError.invalid("payload が大きすぎます (\(len))") }
+        let payload = len > 0 ? try stream.receive(exactly: len) : []
         return (type, payload)
     }
 
-    public func close() { connection.close() }
+    public func close() { stream.close() }
 }

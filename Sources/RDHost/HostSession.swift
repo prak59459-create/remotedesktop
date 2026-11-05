@@ -4,13 +4,18 @@ import RDCore
 
 struct HostOptions {
     var port: UInt16 = defaultPort
+    var bindAddress: String?
     var fps: Double = 30
     var scale: Int = 1
+    var pair = false
+    var confirm = false
 }
 
-/// 1 つのビューア接続を担当する。画面送信ループと入力受信スレッドを持つ。
+/// 認証済みの 1 つのビューア接続を担当する。画面送信ループと入力受信スレッドを持つ。
 final class HostSession {
     private let channel: MessageChannel
+    private let client: HostGatekeeper.Client
+    private let audit: AuditLog
     private let options: HostOptions
     private let injector = makeInjector()
     private let ackSemaphore = DispatchSemaphore(value: 0)
@@ -20,9 +25,14 @@ final class HostSession {
     // 入力座標の変換用 (フレーム座標 → 実画面座標)
     private var mapping = (frameW: 1, frameH: 1, screenW: 1, screenH: 1)
 
-    init(connection: TCPConnection, options: HostOptions) {
-        channel = MessageChannel(connection)
+    private let gate: HostGatekeeper
+
+    init(client: HostGatekeeper.Client, gate: HostGatekeeper, options: HostOptions, audit: AuditLog) {
+        self.client = client
+        self.gate = gate
+        channel = client.channel
         self.options = options
+        self.audit = audit
     }
 
     private var isClosed: Bool {
@@ -46,19 +56,18 @@ final class HostSession {
     }
 
     func run() {
-        let peer = channel.connection.peerDescription
-        print("接続: \(peer)")
         let receiver = Thread { [self] in receiveLoop() }
         receiver.start()
         sendLoop()
         markClosed()
-        print("切断: \(peer)")
+        audit.record("SESSION_END name=\(client.name) peer=\(client.peer)")
     }
 
     // MARK: 画面送信
 
     private func sendLoop() {
         let interval = 1.0 / max(1, options.fps)
+        var lastAuthCheck = Date()
         while !isClosed {
             guard let capturer = makeCapturer(scale: options.scale) else {
                 print("画面キャプチャを初期化できません。1 秒後に再試行します")
@@ -79,6 +88,13 @@ final class HostSession {
 
             while !isClosed {
                 let start = Date()
+                if start.timeIntervalSince(lastAuthCheck) > 2 {
+                    lastAuthCheck = start
+                    if !gate.isStillAuthorized(client.publicKey) {
+                        audit.record("SESSION_KILLED reason=device_revoked name=\(client.name) peer=\(client.peer)")
+                        return
+                    }
+                }
                 if capturer.needsRecreate { break } // 解像度変更 → hello から送り直す
                 if takeKeyframeRequest() { encoder.reset() }
 

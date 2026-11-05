@@ -55,6 +55,12 @@ final class LoggingInputInjector: InputInjector {
     }
 }
 
+/// 端末で接続を許可するか確認する
+func askConsent(name: String, fingerprint: String, peer: String, isNew: Bool) -> Bool {
+    print("\n\(isNew ? "新しい端末" : "端末") 「\(name)」 (\(fingerprint)) が \(peer) から接続を求めています。許可しますか? [y/N] ", terminator: "")
+    return readLine()?.lowercased() == "y"
+}
+
 func makeCapturer(scale: Int) -> ScreenCapturer? { TestPatternCapturer(scale: scale) }
 func makeInjector() -> InputInjector { LoggingInputInjector() }
 func platformSetup() {

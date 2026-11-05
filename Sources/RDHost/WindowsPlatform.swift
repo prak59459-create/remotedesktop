@@ -170,6 +170,27 @@ final class WindowsInputInjector: InputInjector {
     }
 }
 
+/// 接続を許可するか、最前面のダイアログで確認する (既定ボタンは「いいえ」)
+func askConsent(name: String, fingerprint: String, peer: String, isNew: Bool) -> Bool {
+    let text = """
+    \(isNew ? "新しい端末" : "端末") 「\(name)」がこの PC への接続を求めています。
+
+    接続元: \(peer)
+    端末の指紋: \(fingerprint)
+
+    許可すると、この PC の画面を見られ、マウスとキーボードを操作されます。
+    心当たりがなければ「いいえ」を押してください。
+    """
+    let flags: UINT = 0x4 /* MB_YESNO */ | 0x30 /* MB_ICONWARNING */ | 0x100 /* MB_DEFBUTTON2 */
+        | 0x1_0000 /* MB_SETFOREGROUND */ | 0x4_0000 /* MB_TOPMOST */
+    let r = text.withCString(encodedAs: UTF16.self) { t in
+        "RemoteDesktop — 接続の確認".withCString(encodedAs: UTF16.self) { c in
+            MessageBoxW(nil, t, c, flags)
+        }
+    }
+    return r == 6 // IDYES
+}
+
 func makeCapturer(scale: Int) -> ScreenCapturer? { GDICapturer(scale: scale) }
 func makeInjector() -> InputInjector { WindowsInputInjector() }
 func platformSetup() { enableDPIAwareness() }

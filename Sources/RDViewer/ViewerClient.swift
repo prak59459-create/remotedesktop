@@ -15,16 +15,23 @@ final class ViewerClient {
     private var channel: MessageChannel?
     private(set) var bytesReceived = 0
     private(set) var framesReceived = 0
+    private(set) var session: ViewerConnector.Session?
+    private let pairingCode: PairingCode?
 
-    init(host: String, port: UInt16) {
+    init(host: String, port: UInt16, pairingCode: PairingCode? = nil) {
         self.host = host
         self.port = port
+        self.pairingCode = pairingCode
     }
 
-    /// 接続 (ブロッキング) してから受信スレッドを起動する
+    /// 接続・暗号化・相互認証 (ブロッキング) してから受信スレッドを起動する
     func connect() throws {
-        let conn = try TCPConnection.open(host: host, port: port)
-        channel = MessageChannel(conn)
+        let identity = try SecretStore.loadOrCreateIdentity(name: "viewer_identity")
+        let known = try TrustStore(fileName: "trusted_hosts.json")
+        let s = try ViewerConnector.connect(host: host, port: port, identity: identity, knownHosts: known,
+                                            pairingCode: pairingCode, deviceName: deviceName())
+        session = s
+        channel = s.channel
         Thread { [self] in receiveLoop() }.start()
     }
 
@@ -63,4 +70,12 @@ final class ViewerClient {
             onClose?(error)
         }
     }
+}
+
+func deviceName() -> String {
+    #if os(macOS)
+    return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    #else
+    return ProcessInfo.processInfo.hostName
+    #endif
 }
