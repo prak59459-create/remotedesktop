@@ -1,13 +1,14 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
+const crypto = require('node:crypto');
 const WebSocket = require('ws');
-const { server, config } = require('../server');
+const { server, config, roomFromToken, base32 } = require('../server');
 
-const ROOM = 'A'.repeat(26);
 let base;
 
 test.before(async () => {
+  config.hostAuthTimeoutMs = 300;
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   base = `ws://127.0.0.1:${server.address().port}`;
 });
@@ -34,11 +35,50 @@ function open(path) {
 const next = (ws) =>
   ws.inbox.length ? Promise.resolve(ws.inbox.shift()) : new Promise((r) => ws.waiters.push(r));
 const closed = (ws) => ws.closeCode;
+const newToken = () => crypto.randomBytes(32).toString('hex');
+
+/** トークンで部屋を登録したホスト (ping/pong で登録完了を確認) */
+async function host(token) {
+  const room = roomFromToken(token);
+  const ws = await open('/host?room=' + room);
+  ws.send(JSON.stringify({ t: 'auth', token }));
+  ws.send('ping');
+  assert.strictEqual((await next(ws)).d.toString(), 'pong');
+  return { ws, room };
+}
+
+async function session(h) {
+  const viewer = await open('/connect?room=' + h.room);
+  const inc = JSON.parse((await next(h.ws)).d.toString());
+  const acc = await open(`/accept?room=${h.room}&id=${inc.id}`);
+  return { viewer, acc, inc };
+}
+
+test('room id matches the Swift implementation', () => {
+  // Swift: Base32.encode([0x00..0x0F]) と RelayRoom.id(token: [0x00]*32) の値 (SecurityTests と同じ)
+  assert.strictEqual(base32(Buffer.from([...Array(16).keys()])), '000G40R40M30E209185GR38E1W');
+  assert.strictEqual(roomFromToken('00'.repeat(32)).length, 26);
+});
 
 test('rejects malformed rooms and unknown paths', async () => {
   await assert.rejects(open('/host?room=short'), /HTTP 400/);
-  await assert.rejects(open('/admin?room=' + ROOM), /HTTP 400/);
-  await assert.rejects(open('/accept?room=' + ROOM + '&id=zz'), /HTTP 400/);
+  await assert.rejects(open('/admin?room=' + 'A'.repeat(26)), /HTTP 400/);
+  await assert.rejects(open('/accept?room=' + 'A'.repeat(26) + '&id=zz'), /HTTP 400/);
+});
+
+test('a host without the token cannot take a room', async () => {
+  const token = newToken();
+  const room = roomFromToken(token);
+  // 違うトークン
+  const wrong = await open('/host?room=' + room);
+  wrong.send(JSON.stringify({ t: 'auth', token: newToken() }));
+  assert.strictEqual(await closed(wrong), 4003);
+  // 何も送らない
+  const silent = await open('/host?room=' + room);
+  assert.strictEqual(await closed(silent), 4001);
+  // 部屋は登録されていない
+  const v = await open('/connect?room=' + room);
+  assert.strictEqual(await closed(v), 4004);
 });
 
 test('viewer without host is closed', async () => {
@@ -46,63 +86,65 @@ test('viewer without host is closed', async () => {
   assert.strictEqual(await closed(v), 4004);
 });
 
-test('relays binary both ways, room cannot be taken over', async () => {
-  const host = await open('/host?room=' + ROOM);
-  host.send('ping');
-  assert.strictEqual((await next(host)).d.toString(), 'pong');
-
-  const squatter = await open('/host?room=' + ROOM);
-  assert.strictEqual(await closed(squatter), 4009);
-
-  const viewer = await open('/connect?room=' + ROOM);
+test('relays binary both ways; ids are single use; text on the data path is refused', async () => {
+  const h = await host(newToken());
+  const viewer = await open('/connect?room=' + h.room);
   viewer.send(Buffer.from([1, 2, 3])); // ホストが受け取る前に送ったデータも届く
-  const inc = JSON.parse((await next(host)).d.toString());
+  const inc = JSON.parse((await next(h.ws)).d.toString());
   assert.strictEqual(inc.t, 'incoming');
   assert.match(inc.id, /^[0-9a-f]{32}$/);
 
-  // 存在しないセッション ID は WebSocket を確立する前に拒否
-  await assert.rejects(open(`/accept?room=${ROOM}&id=${'0'.repeat(32)}`), /HTTP 404/);
+  await assert.rejects(open(`/accept?room=${h.room}&id=${'0'.repeat(32)}`), /HTTP 404/);
 
-  const acc = await open(`/accept?room=${ROOM}&id=${inc.id}`);
-  const first = await next(acc);
-  assert.deepStrictEqual([...first.d], [1, 2, 3]);
+  const acc = await open(`/accept?room=${h.room}&id=${inc.id}`);
+  assert.deepStrictEqual([...(await next(acc)).d], [1, 2, 3]);
   acc.send(Buffer.from([9]));
   assert.deepStrictEqual([...(await next(viewer)).d], [9]);
 
-  // 同じ ID は二度使えない
-  await assert.rejects(open(`/accept?room=${ROOM}&id=${inc.id}`), /HTTP 404/);
+  await assert.rejects(open(`/accept?room=${h.room}&id=${inc.id}`), /HTTP 404/);
 
-  // データ経路でテキストを送ると両方切断
   const both = Promise.all([closed(viewer), closed(acc)]);
   viewer.send('text is not allowed');
   await both;
-  host.close();
-  await closed(host);
+  h.ws.close();
+  await closed(h.ws);
 });
 
 test('oversized messages are rejected', async () => {
-  const host = await open('/host?room=' + 'C'.repeat(26));
-  const viewer = await open('/connect?room=' + 'C'.repeat(26));
-  const inc = JSON.parse((await next(host)).d.toString());
-  const acc = await open(`/accept?room=${'C'.repeat(26)}&id=${inc.id}`);
+  const h = await host(newToken());
+  const { viewer, acc } = await session(h);
   const c = closed(viewer);
   viewer.send(Buffer.alloc(config.maxMessage + 1));
   assert.strictEqual(await c, 1009);
   acc.close();
-  host.close();
+  h.ws.close();
+});
+
+test('per-room bandwidth limit ends the session', async () => {
+  const saved = [config.roomBytesPerSecond, config.roomBurstBytes];
+  config.roomBytesPerSecond = 1000;
+  config.roomBurstBytes = 100 * 1024;
+  try {
+    const h = await host(newToken());
+    const { viewer, acc } = await session(h);
+    const c = closed(viewer);
+    for (let i = 0; i < 4; i++) viewer.send(Buffer.alloc(60 * 1024));
+    assert.strictEqual(await c, 4029);
+    await closed(acc);
+    h.ws.close();
+  } finally {
+    [config.roomBytesPerSecond, config.roomBurstBytes] = saved;
+  }
 });
 
 test('many sessions in a row are not blocked by the per-IP limit', async () => {
-  const room = 'D'.repeat(26);
-  const host = await open('/host?room=' + room);
+  const h = await host(newToken());
   for (let i = 0; i < 25; i++) {
-    const viewer = await open('/connect?room=' + room);
-    const inc = JSON.parse((await next(host)).d.toString());
-    const acc = await open(`/accept?room=${room}&id=${inc.id}`);
+    const { viewer, acc } = await session(h);
     viewer.send(Buffer.from([i]));
     assert.deepStrictEqual([...(await next(acc)).d], [i]);
     viewer.close();
     await closed(acc);
   }
-  host.close();
+  h.ws.close();
 });

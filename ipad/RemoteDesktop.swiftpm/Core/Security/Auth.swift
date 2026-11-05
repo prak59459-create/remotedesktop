@@ -58,10 +58,13 @@ public struct AuthRequest: Equatable {
 public struct AuthResult: Equatable {
     public var status: AuthStatus
     public var message: String
+    /// 成功時: このホストの中継サーバー上の部屋 ID (登録済み端末にだけ、暗号化された通路で渡す)
+    public var relayRoom: String?
 
-    public init(status: AuthStatus, message: String) {
+    public init(status: AuthStatus, message: String, relayRoom: String? = nil) {
         self.status = status
         self.message = message
+        self.relayRoom = relayRoom
     }
 
     public func encode() -> [UInt8] {
@@ -70,6 +73,9 @@ public struct AuthResult: Equatable {
         let m = Array(Array(message.utf8).prefix(512))
         w.u16(UInt16(m.count))
         w.bytes += m
+        let room = Array((relayRoom ?? "").utf8.prefix(64))
+        w.u8(UInt8(room.count))
+        w.bytes += room
         return w.bytes
     }
 
@@ -79,7 +85,15 @@ public struct AuthResult: Equatable {
         let n = Int(try r.u16())
         let start = r.offset
         try r.skip(n)
-        return AuthResult(status: st, message: String(decoding: p[start ..< start + n], as: UTF8.self))
+        var room: String?
+        if r.remaining > 0 {
+            let rn = Int(try r.u8())
+            let rs = r.offset
+            try r.skip(rn)
+            let text = String(decoding: p[rs ..< rs + rn], as: UTF8.self)
+            if RelayRoom.isValid(text) { room = text }
+        }
+        return AuthResult(status: st, message: String(decoding: p[start ..< start + n], as: UTF8.self), relayRoom: room)
     }
 }
 
@@ -89,6 +103,7 @@ public enum AuthError: Error, CustomStringConvertible {
     case rejected(AuthStatus, String)
     case busy
     case rateLimited(seconds: Int)
+    case noRelayRoom
 
     public var description: String {
         switch self {
@@ -102,6 +117,8 @@ public enum AuthError: Error, CustomStringConvertible {
             return "ホストが混雑しています"
         case .rateLimited(let s):
             return "失敗が続いたため \(s) 秒間ブロックされています"
+        case .noRelayRoom:
+            return "このホストの中継情報がまだありません。一度、同じ Wi-Fi で直接接続してください (中継の設定はそのとき自動で受け取ります)"
         }
     }
 }
@@ -188,6 +205,7 @@ public final class HostGatekeeper {
         public let name: String
         public let publicKey: [UInt8]
         public let peer: String
+        public let isPostQuantum: Bool
     }
 
     /// 画面上で接続を承認するか (nil なら確認しない)。引数: 端末名, 指紋, 接続元, 新規端末か
@@ -202,6 +220,13 @@ public final class HostGatekeeper {
     /// false (既定) なら、新しい端末の登録は LAN 内からの直接接続でだけ受け付ける。
     /// コードを盗み見られても、外からは端末を追加できない。
     public var allowRemotePairing = false
+    /// 新しい端末を登録するときの確認 (必須)。ホストの画面で利用者が許可したときだけ true を返すこと。
+    /// nil のときは新しい端末を登録できない。
+    public var newDeviceConsent: ConsentHandler?
+    /// 登録済み端末に渡す中継の部屋 ID
+    public var relayRoom: String?
+    /// 耐量子鍵交換 (ML-KEM) に対応していない端末を拒否する
+    public var requirePostQuantum = false
     public let maxPendingHandshakes = 4
 
     private var pairing: PairingWindow?
@@ -255,7 +280,7 @@ public final class HostGatekeeper {
         tcp.setReceiveTimeout(handshakeTimeout)
         let secure: SecureStream
         do {
-            secure = try SecureStream.accept(tcp, identity: identity)
+            secure = try SecureStream.accept(tcp, identity: identity, requirePostQuantum: requirePostQuantum)
         } catch {
             limiter.recordFailure(ip)
             audit.record("HANDSHAKE_FAIL peer=\(peer) error=\(error)")
@@ -288,6 +313,10 @@ public final class HostGatekeeper {
 
         var isNew = false
         clients.reload()
+        if clients.isTampered {
+            audit.record("TRUST_STORE_TAMPERED action=reject_all")
+            throw reject(.badRequest, "ホストの設定に問題があります", countFailure: false)
+        }
         if clients.find(publicKey: secure.remoteStaticKey) != nil {
             // 登録済みの端末
         } else if let proof = req.pairingProof {
@@ -311,11 +340,15 @@ public final class HostGatekeeper {
             throw reject(.unknownDevice, "未登録の端末です。ホストで RDHost --pair を実行してペアリングしてください")
         }
 
-        if let consent = consent {
+        // 新しい端末の登録は、ホストの画面で必ず許可を得る (無効にできない)。
+        // 登録済み端末の接続ごとの確認は任意 (--confirm)。
+        if let ask = consent ?? (isNew ? newDeviceConsent : nil) {
             tcp.setReceiveTimeout(0)
-            guard consent(name, fp, peer, isNew) else {
+            guard ask(name, fp, peer, isNew) else {
                 throw reject(.rejectedByUser, "ホストの利用者が接続を拒否しました", countFailure: false)
             }
+        } else if isNew {
+            throw reject(.pairingFailed, "ホストの画面で登録を許可できないため、新しい端末を登録できません", countFailure: false)
         }
 
         if isNew {
@@ -330,10 +363,11 @@ public final class HostGatekeeper {
         }
 
         limiter.recordSuccess(ip)
-        try pre.send(.authResult, AuthResult(status: .ok, message: "ok").encode())
+        try pre.send(.authResult, AuthResult(status: .ok, message: "ok", relayRoom: relayRoom).encode())
         tcp.setReceiveTimeout(0)
-        audit.record("SESSION_START name=\(name) device=\(fp) peer=\(peer)")
-        return Client(channel: MessageChannel(secure), name: name, publicKey: secure.remoteStaticKey, peer: peer)
+        audit.record("SESSION_START name=\(name) device=\(fp) peer=\(peer) pq=\(secure.isPostQuantum)")
+        return Client(channel: MessageChannel(secure), name: name, publicKey: secure.remoteStaticKey, peer: peer,
+                      isPostQuantum: secure.isPostQuantum)
     }
 }
 
@@ -345,6 +379,7 @@ public enum ViewerConnector {
         public let hostPublicKey: [UInt8]
         public let hostFingerprint: String
         public let newlyPaired: Bool
+        public let isPostQuantum: Bool
     }
 
     /// 接続先
@@ -368,13 +403,10 @@ public enum ViewerConnector {
             transport = try TCPConnection.open(host: host, port: port)
             label = "\(host):\(port)"
         case let .relay(url):
-            let room: String
-            if let key = expectedHostKey {
-                room = RelayRoom.id(hostPublicKey: key)
-            } else if let code = pairingCode {
-                room = RelayRoom.id(fingerprintPrefix: code.hostFingerprintPrefix)
-            } else {
-                throw AuthError.unknownHost(fingerprint: "?")
+            // 部屋 ID は、LAN で接続したときにホストから暗号化して受け取ったもの。
+            // 中継経由で初めて接続することはできない (端末の登録は LAN 限定)。
+            guard let key = expectedHostKey, let room = knownHosts.find(publicKey: key)?.relayRoom else {
+                throw AuthError.noRelayRoom
             }
             transport = try RelayTransport.connect(relay: url, room: room)
             label = "relay"
@@ -438,11 +470,12 @@ public enum ViewerConnector {
         }
         tcp.setReceiveTimeout(0)
         if proof != nil {
-            try knownHosts.add(publicKey: hostKey, name: sanitize(label))
+            try knownHosts.add(publicKey: hostKey, name: sanitize(label), relayRoom: result.relayRoom)
         } else {
             knownHosts.touch(publicKey: hostKey)
+            if let room = result.relayRoom { try? knownHosts.setRelayRoom(publicKey: hostKey, room: room) }
         }
         return Session(channel: MessageChannel(secure), hostPublicKey: hostKey, hostFingerprint: fp,
-                       newlyPaired: proof != nil)
+                       newlyPaired: proof != nil, isPostQuantum: secure.isPostQuantum)
     }
 }

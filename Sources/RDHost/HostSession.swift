@@ -12,6 +12,52 @@ struct HostOptions {
     var relay: URL?
     var direct = true
     var allowRemotePairing = false
+    /// 入力が無いまま、この秒数が過ぎたら切断する
+    var idleTimeout: TimeInterval = 15 * 60
+    /// 1 回のセッションの最長時間 (秒)
+    var maxSession: TimeInterval = 8 * 3600
+    var onDisconnect = DisconnectAction.blank
+    var requirePostQuantum = false
+    var allowAdmin = false
+}
+
+/// 接続中のセッション。画面上部の「接続中」表示と、最後の切断時の画面保護を受け持つ。
+final class ActiveSessions {
+    static let shared = ActiveSessions()
+    private let lock = NSLock()
+    private var names: [Int: String] = [:]
+    private var nextID = 0
+    var onDisconnect = DisconnectAction.blank
+
+    func begin(_ name: String) -> Int {
+        lock.lock()
+        nextID += 1
+        let id = nextID
+        names[id] = name
+        let text = label()
+        lock.unlock()
+        showConnectionIndicator(text)
+        return id
+    }
+
+    func end(_ id: Int) {
+        lock.lock()
+        names[id] = nil
+        let empty = names.isEmpty
+        let text = label()
+        lock.unlock()
+        if empty {
+            showConnectionIndicator(nil)
+            performDisconnectAction(onDisconnect)
+        } else {
+            showConnectionIndicator(text)
+        }
+    }
+
+    private func label() -> String {
+        let list = names.values.sorted().joined(separator: "、")
+        return "リモート操作中: \(list)"
+    }
 }
 
 /// 認証済みの 1 つのビューア接続を担当する。画面送信ループと入力受信スレッドを持つ。
@@ -25,6 +71,8 @@ final class HostSession {
     private let stateLock = NSLock()
     private var closed = false
     private var keyframeRequested = false
+    private var lastInput = Date()
+    private let started = Date()
     // 入力座標の変換用 (フレーム座標 → 実画面座標)
     private var mapping = (frameW: 1, frameH: 1, screenW: 1, screenH: 1)
 
@@ -59,22 +107,36 @@ final class HostSession {
     }
 
     func run() {
+        let token = ActiveSessions.shared.begin(client.name)
         let receiver = Thread { [self] in receiveLoop() }
         receiver.start()
-        sendLoop()
+        let reason = sendLoop()
         markClosed()
-        audit.record("SESSION_END name=\(client.name) peer=\(client.peer)")
+        audit.record("SESSION_END name=\(client.name) peer=\(client.peer) reason=\(reason)")
+        ActiveSessions.shared.end(token)
+    }
+
+    /// 無操作・最長時間を超えていれば理由を返す
+    private func expired(now: Date) -> String? {
+        stateLock.lock()
+        let idle = now.timeIntervalSince(lastInput)
+        stateLock.unlock()
+        if idle > options.idleTimeout { return "idle_timeout" }
+        if now.timeIntervalSince(started) > options.maxSession { return "max_session" }
+        return nil
     }
 
     // MARK: 画面送信
 
-    private func sendLoop() {
+    /// 終了理由を返す
+    private func sendLoop() -> String {
         let interval = 1.0 / max(1, options.fps)
         var lastAuthCheck = Date()
         while !isClosed {
             guard let capturer = makeCapturer(scale: options.scale) else {
                 print("画面キャプチャを初期化できません。1 秒後に再試行します")
                 Thread.sleep(forTimeInterval: 1)
+                if let r = expired(now: Date()) { return r }
                 continue
             }
             stateLock.lock()
@@ -85,7 +147,7 @@ final class HostSession {
             do {
                 try channel.send(.hello, Hello(width: capturer.width, height: capturer.height).encode())
             } catch {
-                return
+                return "disconnected"
             }
             let encoder = FrameEncoder(width: capturer.width, height: capturer.height)
 
@@ -95,8 +157,9 @@ final class HostSession {
                     lastAuthCheck = start
                     if !gate.isStillAuthorized(client.publicKey) {
                         audit.record("SESSION_KILLED reason=device_revoked name=\(client.name) peer=\(client.peer)")
-                        return
+                        return "device_revoked"
                     }
+                    if let r = expired(now: start) { return r }
                 }
                 if capturer.needsRecreate { break } // 解像度変更 → hello から送り直す
                 if takeKeyframeRequest() { encoder.reset() }
@@ -106,7 +169,7 @@ final class HostSession {
                     do {
                         try channel.send(.frame, payload)
                     } catch {
-                        return
+                        return "disconnected"
                     }
                     // ビューアが処理し終えるまで次を送らない (遅い回線で溜まらないように)
                     _ = ackSemaphore.wait(timeout: .now() + 5)
@@ -115,6 +178,7 @@ final class HostSession {
                 if elapsed < interval { Thread.sleep(forTimeInterval: interval - elapsed) }
             }
         }
+        return "disconnected"
     }
 
     // MARK: 入力受信
@@ -133,6 +197,12 @@ final class HostSession {
     }
 
     private func handle(_ event: ClientEvent) {
+        switch event {
+        case .frameAck, .requestKeyframe:
+            break
+        default:
+            stateLock.lock(); lastInput = Date(); stateLock.unlock()
+        }
         switch event {
         case .frameAck:
             ackSemaphore.signal()

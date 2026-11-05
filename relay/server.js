@@ -9,7 +9,10 @@
 //   WS   /connect?room=ROOM               ビューアの接続
 //   WS   /accept?room=ROOM&id=SESSION     ホストがセッションを受け取る (以降はバイナリを中継)
 //
-// ROOM はホスト公開鍵から作る 26 文字の値で、知らない人は接続を試すこともできない。
+// ROOM = Base32(SHA-256("RemoteDesktop relay room v2" || トークン))[:26]。
+// トークンはホストだけが持つ 256bit の秘密で、/host の最初のメッセージ {"t":"auth","token":"<hex>"} で示す。
+// 中継サーバーは ROOM がトークンのハッシュと一致するときだけ待ち受けを登録する (部屋の先取り・乗っ取り防止)。
+// ROOM は登録済みの端末にだけ暗号化された通路で渡されるので、知らない人は接続を試すこともできない。
 
 'use strict';
 
@@ -30,12 +33,46 @@ const config = {
   pendingBufferLimit: 256 * 1024,
   maxBuffered: 16 * 1024 * 1024, // 相手が受け取れないまま溜まったら切る (メモリ保護)
   heartbeatMs: 30000,
+  hostAuthTimeoutMs: 5000,
+  // 部屋ごとの帯域 (双方向合計)。無料枠の使い潰し対策。既定 8 MB/s、瞬間的には 64 MB まで
+  roomBytesPerSecond: Number(process.env.ROOM_BYTES_PER_SECOND || 8 * 1024 * 1024),
+  roomBurstBytes: Number(process.env.ROOM_BURST_BYTES || 64 * 1024 * 1024),
+  statsIntervalMs: 10 * 60 * 1000,
 };
+
+const ROOM_LABEL = Buffer.from('RemoteDesktop relay room v2', 'utf8');
+const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** Crockford Base32 (Swift 側の Base32.encode と同じ) */
+function base32(buf) {
+  let out = '';
+  let bits = 0;
+  let value = 0;
+  for (const b of buf) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    value &= (1 << bits) - 1;
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function roomFromToken(tokenHex) {
+  const token = Buffer.from(tokenHex, 'hex');
+  const digest = crypto.createHash('sha256').update(ROOM_LABEL).update(token).digest();
+  return base32(digest.subarray(0, 16));
+}
+
+const stats = { hostAuthFail: 0, rateLimited: 0, bandwidthKilled: 0, sessions: 0 };
 
 const ROOM_RE = /^[0-9A-Z]{26}$/;
 const ID_RE = /^[0-9a-f]{32}$/;
 
-/** room -> { host: WebSocket, pending: Map<id, {viewer, buffer, size, timer, ip}> } */
+/** room -> { host, pending: Map<id, {viewer, buffer, size, timer, ip}>, tokens, last } (tokens = 帯域のバケツ) */
 const rooms = new Map();
 let activeSessions = 0;
 
@@ -81,12 +118,26 @@ function closeBoth(a, b, code, reason) {
   }
 }
 
-/** a で受けたバイナリを b へ。テキストや過大なバッファは切断。 */
-function pipe(a, b) {
+/** 部屋の帯域を消費する。足りなければ false */
+function spend(state, n) {
+  const now = Date.now();
+  state.tokens = Math.min(config.roomBurstBytes, state.tokens + ((now - state.last) / 1000) * config.roomBytesPerSecond);
+  state.last = now;
+  if (state.tokens < n) return false;
+  state.tokens -= n;
+  return true;
+}
+
+/** a で受けたバイナリを b へ。テキストや過大なバッファ、帯域超過は切断。 */
+function pipe(a, b, state) {
   a.on('message', (data, isBinary) => {
     if (!isBinary) return closeBoth(a, b, 1003, 'binary only');
     if (b.readyState !== 1) return;
     if (b.bufferedAmount > config.maxBuffered) return closeBoth(a, b, 1013, 'backpressure');
+    if (state && !spend(state, data.length)) {
+      stats.bandwidthKilled++;
+      return closeBoth(a, b, 4029, 'bandwidth limit');
+    }
     b.send(data, { binary: true });
   });
   a.on('close', () => closeBoth(a, b, 1000, 'peer closed'));
@@ -94,22 +145,51 @@ function pipe(a, b) {
 }
 
 function handleHost(ws, room, ip) {
-  const existing = rooms.get(room);
-  if (existing && existing.host.readyState === 1) {
-    // 先着優先。乗っ取りはできない (できても端末側の鍵検証で弾かれるが、妨害を防ぐ)
-    return ws.close(4009, 'room in use');
-  }
-  if (!existing && rooms.size >= config.maxRooms) return ws.close(4029, 'server full');
-  const state = existing || { host: ws, pending: new Map() };
-  state.host = ws;
-  rooms.set(room, state);
-  log('host up', room.slice(0, 4) + '…');
+  // 最初のメッセージで部屋トークンを示すまでは何もさせない
+  let authed = false;
+  const timer = setTimeout(() => {
+    if (!authed) ws.close(4001, 'auth timeout');
+  }, config.hostAuthTimeoutMs);
 
   ws.on('message', (data, isBinary) => {
-    if (isBinary || data.length > 64) return ws.close(1003, 'control only');
-    if (data.toString() === 'ping') ws.send('pong');
+    if (isBinary || data.length > 256) return ws.close(1003, 'control only');
+    const text = data.toString();
+    if (!authed) {
+      let msg;
+      try {
+        msg = JSON.parse(text);
+      } catch {
+        return ws.close(4001, 'bad auth');
+      }
+      const token = msg && msg.t === 'auth' && typeof msg.token === 'string' ? msg.token : '';
+      const ok = /^[0-9a-f]{64}$/.test(token) &&
+        crypto.timingSafeEqual(Buffer.from(roomFromToken(token)), Buffer.from(room));
+      if (!ok) {
+        stats.hostAuthFail++;
+        return ws.close(4003, 'bad token');
+      }
+      authed = true;
+      clearTimeout(timer);
+      return register();
+    }
+    if (text === 'ping') ws.send('pong');
   });
+
+  function register() {
+    const existing = rooms.get(room);
+    if (existing && existing.host.readyState === 1 && existing.host !== ws) {
+      // 同じトークンを持つホストが既にいる (二重起動など)。新しい方を優先して古い方を切る
+      existing.host.close(4010, 'replaced');
+    }
+    if (!existing && rooms.size >= config.maxRooms) return ws.close(4029, 'server full');
+    const state = existing || { host: ws, pending: new Map(), tokens: config.roomBurstBytes, last: Date.now() };
+    state.host = ws;
+    rooms.set(room, state);
+    log('host up', room.slice(0, 4) + '…');
+  }
+
   ws.on('close', () => {
+    clearTimeout(timer);
     const s = rooms.get(room);
     if (s && s.host === ws) {
       for (const p of s.pending.values()) {
@@ -174,8 +254,9 @@ function handleAccept(ws, room, id) {
   ws.on('close', done);
   p.viewer.on('close', done);
 
-  pipe(p.viewer, ws);
-  pipe(ws, p.viewer);
+  pipe(p.viewer, ws, state);
+  pipe(ws, p.viewer, state);
+  stats.sessions++;
   for (const chunk of p.buffer) ws.send(chunk, { binary: true });
   p.buffer = [];
   log('session', room.slice(0, 4) + '…', 'active=' + activeSessions);
@@ -222,6 +303,7 @@ server.on('upgrade', (req, socket, head) => {
       return socket.destroy();
     }
   } else if (!admit(ip)) {
+    stats.rateLimited++;
     log('rate limited', kind);
     socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
     return socket.destroy();
@@ -254,6 +336,12 @@ const heartbeat = setInterval(() => {
 }, config.heartbeatMs);
 heartbeat.unref();
 
+// 異常の兆候 (トークン不一致・レート制限・帯域超過) を定期的に記録
+const statsTimer = setInterval(() => {
+  log('stats', JSON.stringify({ rooms: rooms.size, active: activeSessions, ...stats }));
+}, config.statsIntervalMs);
+statsTimer.unref();
+
 server.headersTimeout = 10000;
 server.requestTimeout = 10000;
 
@@ -261,4 +349,4 @@ if (require.main === module) {
   server.listen(config.port, () => log('relay listening on', config.port));
 }
 
-module.exports = { server, config, rooms };
+module.exports = { server, config, rooms, roomFromToken, base32 };

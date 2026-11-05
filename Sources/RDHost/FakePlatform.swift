@@ -59,8 +59,25 @@ final class LoggingInputInjector: InputInjector {
 
 /// 端末で接続を許可するか確認する
 func askConsent(name: String, fingerprint: String, peer: String, isNew: Bool) -> Bool {
+    // 自動テスト用 (Windows 版には存在しない)
+    if let auto = ProcessInfo.processInfo.environment["RD_TEST_AUTO_APPROVE"] {
+        print("[test] 自動で\(auto == "1" ? "許可" : "拒否"): \(name)")
+        return auto == "1"
+    }
     print("\n\(isNew ? "新しい端末" : "端末") 「\(name)」 (\(fingerprint)) が \(peer) から接続を求めています。許可しますか? [y/N] ", terminator: "")
     return readLine()?.lowercased() == "y"
+}
+
+func performDisconnectAction(_ action: DisconnectAction) {
+    print("[platform] 最後のセッションが終了: \(action.rawValue)")
+}
+
+func isRunningElevated() -> Bool { false }
+
+func writeEventLog(_ line: String, warning: Bool) {}
+
+func showConnectionIndicator(_ text: String?) {
+    print("[platform] 接続中の表示: \(text ?? "(消去)")")
 }
 
 func makeCapturer(scale: Int) -> ScreenCapturer? { TestPatternCapturer(scale: scale) }

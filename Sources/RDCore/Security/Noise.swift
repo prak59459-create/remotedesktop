@@ -44,8 +44,26 @@ public let noiseMaxMessage = 65535
 struct NoiseCipherState {
     private(set) var key: SymmetricKey?
     private(set) var nonce: UInt64 = 0
+    /// この数のメッセージごとに鍵を更新する (Noise 仕様の Rekey)。0 なら更新しない。
+    /// 両端が同じ回数で更新するので、追加のやり取りは要らない。
+    var rekeyInterval: UInt64 = 0
+    private(set) var rekeyCount = 0
 
     init(key: SymmetricKey? = nil) { self.key = key }
+
+    /// REKEY(k) = ENCRYPT(k, 2^64-1, 空, 32 バイトの 0) の先頭 32 バイト
+    mutating func rekey() throws {
+        guard let k = key else { return }
+        let box = try ChaChaPoly.seal([UInt8](repeating: 0, count: 32), using: k,
+                                      nonce: try ChaChaPoly.Nonce(data: Self.nonceBytes(UInt64.max)),
+                                      authenticating: [UInt8]())
+        key = SymmetricKey(data: Array(box.ciphertext.prefix(32)))
+        rekeyCount += 1
+    }
+
+    private mutating func afterMessage() throws {
+        if rekeyInterval > 0 && nonce % rekeyInterval == 0 { try rekey() }
+    }
 
     var hasKey: Bool { key != nil }
 
@@ -66,6 +84,7 @@ struct NoiseCipherState {
         nonce += 1
         var out = [UInt8](box.ciphertext)
         out.append(contentsOf: box.tag)
+        try afterMessage()
         return out
     }
 
@@ -80,6 +99,7 @@ struct NoiseCipherState {
                                                tag: ciphertext[split...])
             let pt = try ChaChaPoly.open(box, using: k, authenticating: ad)
             nonce += 1 // 成功したときだけ進める
+            try afterMessage()
             return [UInt8](pt)
         } catch {
             throw NoiseError.decryptFailed

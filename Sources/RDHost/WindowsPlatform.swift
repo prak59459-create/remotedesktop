@@ -1,4 +1,6 @@
 #if os(Windows)
+import Dispatch
+import Foundation
 import WinSDK
 
 // マクロのキャスト付き定数は Swift に取り込まれないことがあるので自前で定義する
@@ -210,6 +212,128 @@ func askConsent(name: String, fingerprint: String, peer: String, isNew: Bool) ->
         }
     }
     return r == 6 // IDYES
+}
+
+// MARK: - 切断時の画面保護
+
+func performDisconnectAction(_ action: DisconnectAction) {
+    switch action {
+    case .blank:
+        // HWND_BROADCAST へ SC_MONITORPOWER(2 = 電源オフ)。応答しないウィンドウで止まらないよう Post で送る
+        _ = PostMessageW(HWND(bitPattern: 0xFFFF), 0x0112 /* WM_SYSCOMMAND */, 0xF170 /* SC_MONITORPOWER */, 2)
+    case .lock:
+        _ = LockWorkStation()
+    case .none:
+        break
+    }
+}
+
+// MARK: - 管理者権限の確認
+
+func isRunningElevated() -> Bool {
+    var token: HANDLE? = nil
+    guard OpenProcessToken(GetCurrentProcess(), DWORD(0x0008) /* TOKEN_QUERY */, &token), let t = token else { return false }
+    defer { CloseHandle(t) }
+    var elevation = TOKEN_ELEVATION()
+    var size: DWORD = 0
+    guard GetTokenInformation(t, TokenElevation, &elevation, DWORD(MemoryLayout<TOKEN_ELEVATION>.size), &size) else {
+        return false
+    }
+    return elevation.TokenIsElevated != 0
+}
+
+// MARK: - Windows イベントログ (監査ログの写し)
+
+private let eventSource: HANDLE? = "RemoteDesktop".withCString(encodedAs: UTF16.self) { RegisterEventSourceW(nil, $0) }
+
+func writeEventLog(_ line: String, warning: Bool) {
+    guard let h = eventSource else { return }
+    line.withCString(encodedAs: UTF16.self) { p in
+        var strings: [LPCWSTR?] = [p]
+        _ = strings.withUnsafeMutableBufferPointer { buf in
+            ReportEventW(h, WORD(warning ? 0x0002 : 0x0004), 0, 1000, nil, 1, 0, buf.baseAddress, nil)
+        }
+    }
+}
+
+// MARK: - 接続中の表示 (画面上部の帯)
+
+/// 遠隔操作されている間、画面上部に常に赤い帯を出す。その場にいる人が気づけるように。
+final class ConnectionIndicator {
+    static let shared = ConnectionIndicator()
+    private var hwnd: HWND?
+    private let ready = DispatchSemaphore(value: 0)
+    private var started = false
+    private let lock = NSLock()
+
+    private func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        if started { return }
+        started = true
+        Thread { [self] in runLoop() }.start()
+        _ = ready.wait(timeout: .now() + 3)
+    }
+
+    func show(_ text: String) {
+        start()
+        guard let h = hwnd else { return }
+        text.withCString(encodedAs: UTF16.self) { _ = SetWindowTextW(h, $0) }
+        _ = InvalidateRect(h, nil, true)
+        _ = ShowWindow(h, 4 /* SW_SHOWNOACTIVATE */)
+    }
+
+    func hide() {
+        guard let h = hwnd else { return }
+        _ = ShowWindow(h, 0 /* SW_HIDE */)
+    }
+
+    private func runLoop() {
+        let hInstance = GetModuleHandleW(nil)
+        let className = Array("RDHostIndicator".utf16) + [0]
+        className.withUnsafeBufferPointer { cls in
+            var wc = WNDCLASSW()
+            wc.lpfnWndProc = { hwnd, msg, wParam, lParam in
+                if msg == 0x000F /* WM_PAINT */ {
+                    var ps = PAINTSTRUCT()
+                    let dc = BeginPaint(hwnd, &ps)
+                    var rect = RECT()
+                    _ = GetClientRect(hwnd, &rect)
+                    let brush = CreateSolidBrush(0x0000_2BC8) // 赤 (BGR)
+                    _ = FillRect(dc, &rect, brush)
+                    _ = DeleteObject(HGDIOBJ(brush))
+                    var buf = [WCHAR](repeating: 0, count: 256)
+                    let n = GetWindowTextW(hwnd, &buf, 256)
+                    _ = SetBkMode(dc, 1 /* TRANSPARENT */)
+                    _ = SetTextColor(dc, 0x00FF_FFFF)
+                    _ = DrawTextW(dc, buf, n, &rect, 0x1 | 0x4 | 0x20 /* DT_CENTER | DT_VCENTER | DT_SINGLELINE */)
+                    _ = EndPaint(hwnd, &ps)
+                    return 0
+                }
+                return DefWindowProcW(hwnd, msg, wParam, lParam)
+            }
+            wc.hInstance = hInstance
+            wc.lpszClassName = cls.baseAddress
+            _ = RegisterClassW(&wc)
+            let width: Int32 = 460, height: Int32 = 30
+            let x = (GetSystemMetrics(0) - width) / 2
+            // TOPMOST | TOOLWINDOW | TRANSPARENT(クリックを通す) | LAYERED | NOACTIVATE
+            let exStyle: DWORD = 0x8 | 0x80 | 0x20 | 0x8_0000 | 0x800_0000
+            hwnd = CreateWindowExW(exStyle, cls.baseAddress, nil, 0x8000_0000 /* WS_POPUP */,
+                                   x, 0, width, height, nil, nil, hInstance, nil)
+            if let h = hwnd { _ = SetLayeredWindowAttributes(h, 0, 230, 0x2 /* LWA_ALPHA */) }
+        }
+        ready.signal()
+        var msg = MSG()
+        while GetMessageW(&msg, nil, 0, 0) {
+            _ = TranslateMessage(&msg)
+            _ = DispatchMessageW(&msg)
+        }
+    }
+}
+
+func showConnectionIndicator(_ text: String?) {
+    if let t = text { ConnectionIndicator.shared.show(t) } else { ConnectionIndicator.shared.hide() }
 }
 
 func makeCapturer(scale: Int) -> ScreenCapturer? { GDICapturer(scale: scale) }

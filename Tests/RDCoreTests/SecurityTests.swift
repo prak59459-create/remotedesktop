@@ -232,30 +232,36 @@ final class SecurityTests: XCTestCase {
         let hostIdentity: StaticIdentity
     }
 
-    private func startHost(streaming: Bool = false) throws -> Env {
+    private func startHost(streaming: Bool = false,
+                           newDeviceConsent: HostGatekeeper.ConsentHandler? = { _, _, _, _ in true }) throws -> Env {
         let id = StaticIdentity.generate()
         let gate = HostGatekeeper(identity: id, clients: try TrustStore(fileName: "authorized_devices.json"),
                                   audit: AuditLog())
         gate.handshakeTimeout = 3
+        gate.newDeviceConsent = newDeviceConsent
         let p = port()
         let listener = try TCPListener(port: p, bindAddress: "127.0.0.1")
         Thread {
             while true {
                 guard let c = try? listener.accept() else { return }
-                Thread {
-                    guard let client = try? gate.authenticate(c) else { return }
-                    // 認証できたら hello を送る (streaming なら、実際の画面配信のように切れるまで送り続ける)
-                    repeat {
-                        do {
-                            try client.channel.send(.hello, Hello(width: 1, height: 1).encode())
-                        } catch {
-                            return
-                        }
-                    } while streaming
-                }.start()
+                Self.serve(gate, c, streaming: streaming)
             }
         }.start()
         return Env(gate: gate, port: p, hostIdentity: id)
+    }
+
+    /// 認証できたら hello を送る (streaming なら、実際の画面配信のように切れるまで送り続ける)
+    private static func serve(_ gate: HostGatekeeper, _ t: Transport, streaming: Bool) {
+        Thread {
+            guard let client = try? gate.authenticate(t) else { return }
+            repeat {
+                do {
+                    try client.channel.send(.hello, Hello(width: 1, height: 1).encode())
+                } catch {
+                    return
+                }
+            } while streaming
+        }.start()
     }
 
     private func viewerConnect(_ env: Env, viewer: StaticIdentity, code: PairingCode?,
@@ -366,9 +372,9 @@ final class SecurityTests: XCTestCase {
         proc.executableURL = URL(fileURLWithPath: node)
         proc.arguments = [script.path]
         // 環境変数は引き継ぐ (Windows では SystemRoot などが無いと node が起動しない)
-        var env = ProcessInfo.processInfo.environment
-        env["PORT"] = String(relayPort)
-        proc.environment = env
+        var penv = ProcessInfo.processInfo.environment
+        penv["PORT"] = String(relayPort)
+        proc.environment = penv
         proc.standardOutput = FileHandle.nullDevice
         try proc.run()
         defer { proc.terminate() }
@@ -385,44 +391,56 @@ final class SecurityTests: XCTestCase {
         XCTAssertTrue(ready, "中継サーバーが起動しませんでした")
         let relayURL = URL(string: "ws://127.0.0.1:\(relayPort)")!
 
-        let hostID = StaticIdentity.generate()
-        let gate = HostGatekeeper(identity: hostID, clients: try TrustStore(fileName: "authorized_devices.json"),
-                                  audit: AuditLog())
-        let listener = RelayHostListener(relay: relayURL, hostPublicKey: hostID.publicKey) { _ in }
+        let env = try startHost(streaming: true)
+        let gate = env.gate
+        let token = [UInt8](repeating: 7, count: 32)
+        gate.relayRoom = RelayRoom.id(token: token)
+        let listener = RelayHostListener(relay: relayURL, roomToken: token) { _ in }
         defer { listener.stop() }
-        Thread {
-            listener.run { transport in
-                guard let client = try? gate.authenticate(transport) else { return }
-                while (try? client.channel.send(.hello, Hello(width: 1, height: 1).encode())) != nil {}
-            }
-        }.start()
+        Thread { listener.run { Self.serve(gate, $0, streaming: true) } }.start()
         Thread.sleep(forTimeInterval: 0.7)
 
         let viewer = StaticIdentity.generate()
         let known = TrustStore.inMemoryForTesting()
-        // 中継経由のペアリングは既定で拒否 (LAN 限定)
-        let window = gate.startPairing()
+
+        // まだ LAN で接続していない端末は、中継の部屋を知らないので中継経由では接続できない
         XCTAssertThrowsError(try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
-                                                         pairingCode: window.code, deviceName: "v")) { e in
+                                                         expectedHostKey: env.hostIdentity.publicKey,
+                                                         pairingCode: nil, deviceName: "v")) { e in
+            guard case AuthError.noRelayRoom = e else { return XCTFail("\(e)") }
+        }
+
+        // 部屋 ID を知っていても、中継経由のペアリングはホストが拒否する (LAN 限定)
+        let window = gate.startPairing()
+        let t = try RelayTransport.connect(relay: relayURL, room: gate.relayRoom!)
+        XCTAssertThrowsError(try ViewerConnector.connect(transport: t, label: "relay", identity: viewer, knownHosts: known,
+                                                         expectedHostKey: nil, pairingCode: window.code,
+                                                         deviceName: "v")) { e in
             guard case AuthError.rejected(.pairingFailed, _) = e else { return XCTFail("\(e)") }
         }
         gate.limiter.recordSuccess("relay:127.0.0.1")
+        gate.limiter.recordSuccess("relay:::ffff:127.0.0.1")
 
-        // 登録済みなら、保存したホスト鍵だけを頼りに何度でも接続できる (セッション間の混線もない)
-        try gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        // LAN でペアリングすると、ホストから部屋 ID が暗号化されて届く
+        let paired = try viewerConnect(env, viewer: viewer, code: window.code, known: known)
+        paired.channel.close()
+        XCTAssertEqual(known.find(publicKey: env.hostIdentity.publicKey)?.relayRoom, gate.relayRoom)
+
+        // 以降は中継経由で何度でも接続できる (セッション間の混線もない)
         for i in 0 ..< 25 {
             let s = try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
-                                                expectedHostKey: hostID.publicKey, pairingCode: nil, deviceName: "v")
+                                                expectedHostKey: env.hostIdentity.publicKey, pairingCode: nil,
+                                                deviceName: "v")
+            if i == 0 { XCTAssertEqual(s.isPostQuantum, PostQuantum.isAvailable) }
             for _ in 0 ..< 3 {
                 XCTAssertEqual(try s.channel.receive().type, MessageType.hello.rawValue, "iteration \(i)")
             }
             s.channel.close()
         }
 
-        // 別のホスト鍵を期待して接続すると (部屋が違うので) つながらない
-        XCTAssertThrowsError(try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
-                                                         expectedHostKey: StaticIdentity.generate().publicKey,
-                                                         pairingCode: nil, deviceName: "v"))
+        // トークンを知らないホストは同じ部屋を取れない (中継サーバーが拒否)
+        let impostor = RelayHostListener(relay: relayURL, roomToken: [UInt8](repeating: 8, count: 32)) { _ in }
+        XCTAssertNotEqual(impostor.room, gate.relayRoom)
     }
 
     func testPairingIsLANOnlyByDefault() {
@@ -432,11 +450,135 @@ final class SecurityTests: XCTestCase {
         XCTAssertFalse(isPrivateIPv4("172.32.0.1"))
         XCTAssertFalse(isPrivateIPv4("8.8.8.8"))
         XCTAssertFalse(isPrivateIPv4("relay:1.2.3.4"))
-        XCTAssertEqual(RelayRoom.id(hostPublicKey: [UInt8](repeating: 1, count: 32)).count, 26)
-        let k = StaticIdentity.generate().publicKey
-        let code = PairingCode(hostPublicKey: k)
-        // ペアリングコードからもホスト鍵からも同じ部屋 ID になる
-        XCTAssertEqual(RelayRoom.id(fingerprintPrefix: code.hostFingerprintPrefix), RelayRoom.id(hostPublicKey: k))
+    }
+
+    /// 中継サーバー (JavaScript) と同じ値になること (relay/test/relay.test.js と同じ定数)
+    func testRelayRoomMatchesRelayServer() {
+        XCTAssertEqual(Base32.encode(Array(0 ..< 16)), "000G40R40M30E209185GR38E1W")
+        XCTAssertEqual(RelayRoom.id(token: [UInt8](repeating: 0, count: 32)), "10CQBJQ2JWFQ6ZWHHJPGA5AM1G")
+        XCTAssertTrue(RelayRoom.isValid("10CQBJQ2JWFQ6ZWHHJPGA5AM1G"))
+        XCTAssertFalse(RelayRoom.isValid("../../etc/passwd"))
+        let r = AuthResult(status: .ok, message: "ok", relayRoom: "10CQBJQ2JWFQ6ZWHHJPGA5AM1G")
+        XCTAssertEqual(try AuthResult.decode(r.encode()), r)
+        // 不正な部屋 ID は受け取らない
+        let bad = AuthResult(status: .ok, message: "ok", relayRoom: "not-a-room")
+        XCTAssertNil(try AuthResult.decode(bad.encode()).relayRoom)
+    }
+
+    // MARK: 追加の防御
+
+    func testNewDeviceRequiresOnScreenApproval() throws {
+        // 承認できる画面が無い → 登録できない
+        let noScreen = try startHost(newDeviceConsent: nil)
+        let w1 = noScreen.gate.startPairing()
+        XCTAssertThrowsError(try viewerConnect(noScreen, viewer: .generate(), code: w1.code,
+                                               known: .inMemoryForTesting())) { e in
+            guard case AuthError.rejected(.pairingFailed, _) = e else { return XCTFail("\(e)") }
+        }
+        // 利用者が「いいえ」 → 登録されない
+        let denied = try startHost(newDeviceConsent: { _, _, _, isNew in XCTAssertTrue(isNew); return false })
+        let w2 = denied.gate.startPairing()
+        let v = StaticIdentity.generate()
+        XCTAssertThrowsError(try viewerConnect(denied, viewer: v, code: w2.code, known: .inMemoryForTesting())) { e in
+            guard case AuthError.rejected(.rejectedByUser, _) = e else { return XCTFail("\(e)") }
+        }
+        XCTAssertNil(denied.gate.clients.find(publicKey: v.publicKey))
+    }
+
+    func testPostQuantumNegotiation() throws {
+        let env = try startHost()
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        try env.gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        try known.add(publicKey: env.hostIdentity.publicKey, name: "h")
+        let s = try viewerConnect(env, viewer: viewer, code: nil, known: known)
+        XCTAssertEqual(s.isPostQuantum, PostQuantum.isAvailable)
+        s.channel.close()
+
+        // ホストが必須にしていて、端末が対応していなければ拒否
+        env.gate.requirePostQuantum = true
+        let tcp = try TCPConnection.open(host: "127.0.0.1", port: env.port)
+        XCTAssertThrowsError(try SecureStream.connect(tcp, identity: viewer, offerPostQuantum: false)) { e in
+            guard case SecureStreamError.postQuantumRequired = e else { return XCTFail("\(e)") }
+        }
+        // 対応していれば通る
+        if PostQuantum.isAvailable {
+            let s2 = try viewerConnect(env, viewer: viewer, code: nil, known: known)
+            XCTAssertTrue(s2.isPostQuantum)
+            s2.channel.close()
+        }
+    }
+
+    func testRekeyKeepsBothSidesInSync() throws {
+        let saved = SecureStream.rekeyInterval
+        SecureStream.rekeyInterval = 3
+        defer { SecureStream.rekeyInterval = saved }
+        let env = try startHost(streaming: true)
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        try env.gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        try known.add(publicKey: env.hostIdentity.publicKey, name: "h")
+        let s = try viewerConnect(env, viewer: viewer, code: nil, known: known)
+        for _ in 0 ..< 50 { XCTAssertEqual(try s.channel.receive().type, MessageType.hello.rawValue) }
+        let stream = try XCTUnwrap(s.channel.stream as? SecureStream)
+        XCTAssertGreaterThan(stream.rekeyCounts.receive, 10)
+        s.channel.close()
+    }
+
+    func testRekeyChangesTheKey() throws {
+        var a = NoiseCipherState(key: SymmetricKey(data: [UInt8](repeating: 1, count: 32)))
+        var b = a
+        let before = try a.encrypt(ad: [], [1, 2, 3])
+        _ = try b.decrypt(ad: [], before)
+        try a.rekey()
+        try b.rekey()
+        let after = try a.encrypt(ad: [], [1, 2, 3])
+        XCTAssertEqual(try b.decrypt(ad: [], after), [1, 2, 3])
+        // 古い鍵では開けない
+        var old = NoiseCipherState(key: SymmetricKey(data: [UInt8](repeating: 1, count: 32)))
+        _ = try old.decrypt(ad: [], before)
+        XCTAssertThrowsError(try old.decrypt(ad: [], after))
+    }
+
+    func testTrustStoreDetectsTampering() throws {
+        let key = [UInt8](repeating: 5, count: 32)
+        let store = try TrustStore(fileName: "devices.json", integrityKey: key)
+        try store.add(publicKey: StaticIdentity.generate().publicKey, name: "ipad")
+        XCTAssertFalse(store.isTampered)
+
+        // ファイルを直接書き換えて端末を追加する攻撃
+        let url = tmpDir.appendingPathComponent("devices.json")
+        var text = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+        text = text.replacingOccurrences(of: "ipad", with: "evil")
+        try Data(text.utf8).write(to: url)
+        store.reload()
+        XCTAssertTrue(store.isTampered)
+        XCTAssertTrue(store.all.isEmpty)
+        XCTAssertThrowsError(try store.add(publicKey: [1], name: "x"))
+
+        // 署名のない古い形式に差し替える攻撃
+        try Data("[]".utf8).write(to: url)
+        XCTAssertTrue(try TrustStore(fileName: "devices.json", integrityKey: key).isTampered)
+        // 初めて鍵を作ったときだけ、古い形式を受け入れて署名付きに移行する
+        let migrated = try TrustStore(fileName: "devices.json", integrityKey: key, acceptUnsignedOnce: true)
+        XCTAssertFalse(migrated.isTampered)
+        XCTAssertFalse(try TrustStore(fileName: "devices.json", integrityKey: key).isTampered)
+        // 鍵が違えば改ざん扱い
+        XCTAssertTrue(try TrustStore(fileName: "devices.json", integrityKey: [UInt8](repeating: 6, count: 32)).isTampered)
+    }
+
+    func testAuditLogHashChain() throws {
+        let log = AuditLog(fileName: "audit-test.log")
+        for i in 0 ..< 5 { log.record("EVENT \(i)") }
+        XCTAssertEqual(AuditLog.verify(fileName: "audit-test.log"), .ok(lines: 5))
+        // 再起動後も続きからつながる
+        AuditLog(fileName: "audit-test.log").record("AFTER RESTART")
+        XCTAssertEqual(AuditLog.verify(fileName: "audit-test.log"), .ok(lines: 6))
+        // 途中の行を書き換えると検出される
+        let url = tmpDir.appendingPathComponent("audit-test.log")
+        let text = String(decoding: try Data(contentsOf: url), as: UTF8.self).replacingOccurrences(of: "EVENT 2", with: "EVENT X")
+        try Data(text.utf8).write(to: url)
+        XCTAssertEqual(AuditLog.verify(fileName: "audit-test.log"), .broken(atLine: 3))
     }
 
     func testWrongPairingCodeIsRateLimited() throws {

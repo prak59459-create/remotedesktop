@@ -11,15 +11,19 @@ import Crypto
 // 中継サーバーは暗号文を受け渡すだけで、鍵を持たないので中身を読めない。改ざんすれば Noise が検出して切断する。
 
 public enum RelayRoom {
-    /// 部屋 ID = SHA-256(ラベル || ホスト指紋の先頭 80bit) の先頭 128bit を Base32 (26 文字)。
-    /// ペアリングコードを持っているビューアだけが計算できる。
-    public static func id(fingerprintPrefix: [UInt8]) -> String {
-        let digest = SHA256.hash(data: Array("RemoteDesktop relay room v1".utf8) + fingerprintPrefix)
+    /// 部屋 ID = SHA-256(ラベル || 部屋トークン) の先頭 128bit を Base32 (26 文字)。
+    /// トークンはホストだけが持つ 256bit の秘密で、中継サーバーは「ID がトークンのハッシュと一致するか」を確かめてから
+    /// 待ち受けを登録させる。ID を知っていてもトークンは分からないので、部屋の先取り・乗っ取りはできない。
+    /// ID は登録済みの端末にだけ、暗号化された通路で渡す。
+    public static let label = "RemoteDesktop relay room v2"
+
+    public static func id(token: [UInt8]) -> String {
+        let digest = SHA256.hash(data: Array(label.utf8) + token)
         return Base32.encode(Array(Array(digest).prefix(16)))
     }
 
-    public static func id(hostPublicKey: [UInt8]) -> String {
-        id(fingerprintPrefix: Array(Fingerprint.digest(hostPublicKey).prefix(PairingCode.fingerprintLength)))
+    public static func isValid(_ room: String) -> Bool {
+        room.count == 26 && room.utf8.allSatisfy { Base32.alphabet.contains($0) }
     }
 
     static func url(_ base: URL, path: String, query: [String: String]) throws -> URL {
@@ -137,9 +141,12 @@ public final class RelayHostListener {
     private let lock = NSLock()
     private var control: WebSocketConnection?
 
-    public init(relay: URL, hostPublicKey: [UInt8], log: @escaping (String) -> Void) {
+    private let token: [UInt8]
+
+    public init(relay: URL, roomToken: [UInt8], log: @escaping (String) -> Void) {
         self.relay = relay
-        room = RelayRoom.id(hostPublicKey: hostPublicKey)
+        token = roomToken
+        room = RelayRoom.id(token: roomToken)
         self.log = log
     }
 
@@ -162,6 +169,8 @@ public final class RelayHostListener {
         while !isStopped {
             do {
                 let ws = try WebSocketClient.connect(try RelayRoom.url(relay, path: "/host", query: ["room": room]))
+                // トークンは URL に入れない (中継サーバーやプロキシのアクセスログに残さないため)
+                try ws.send(.text("{\"t\":\"auth\",\"token\":\"\(Fingerprint.hex(token))\"}"))
                 lock.lock(); control = ws; lock.unlock()
                 log("RELAY_UP relay=\(relay.host ?? "?")")
                 backoff = 2

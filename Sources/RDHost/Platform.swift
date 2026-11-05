@@ -23,3 +23,13 @@ protocol InputInjector: AnyObject {
     /// 文字列をそのまま入力する (キー配列に依存しない)
     func text(_ s: String)
 }
+
+/// 最後のセッションが終わったときに画面をどうするか
+enum DisconnectAction: String {
+    /// モニターを消す (その場の人に画面を見られにくくする。ローカルで触れば点く)
+    case blank
+    /// Windows をロックする (家に人がいる場合向け。ロック画面は遠隔から解除できないので次の接続は帰宅後)
+    case lock
+    /// 何もしない
+    case none
+}
