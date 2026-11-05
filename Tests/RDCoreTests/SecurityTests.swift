@@ -365,11 +365,24 @@ final class SecurityTests: XCTestCase {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: node)
         proc.arguments = [script.path]
-        proc.environment = ["PORT": String(relayPort)]
+        // 環境変数は引き継ぐ (Windows では SystemRoot などが無いと node が起動しない)
+        var env = ProcessInfo.processInfo.environment
+        env["PORT"] = String(relayPort)
+        proc.environment = env
         proc.standardOutput = FileHandle.nullDevice
         try proc.run()
         defer { proc.terminate() }
-        Thread.sleep(forTimeInterval: 0.7)
+        // 中継サーバーが待ち受けを始めるまで待つ
+        var ready = false
+        for _ in 0 ..< 100 where !ready {
+            if let c = try? TCPConnection.open(host: "127.0.0.1", port: relayPort) {
+                c.close()
+                ready = true
+            } else {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+        XCTAssertTrue(ready, "中継サーバーが起動しませんでした")
         let relayURL = URL(string: "ws://127.0.0.1:\(relayPort)")!
 
         let hostID = StaticIdentity.generate()
