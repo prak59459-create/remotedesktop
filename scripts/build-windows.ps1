@@ -1,4 +1,4 @@
-# RDHost.exe をビルドし、実行に必要な Swift ランタイム DLL と一緒に dist\RDHost へまとめる。
+﻿# RDHost.exe をビルドし、実行に必要な Swift ランタイム DLL と一緒に dist\RDHost へまとめる。
 # 使い方 (Swift for Windows をインストールした PowerShell で):
 #   powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 $ErrorActionPreference = "Stop"

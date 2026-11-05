@@ -2,6 +2,7 @@ name: build
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -15,7 +16,8 @@ jobs:
           branch: swift-6.0.3-release
           tag: 6.0.3-RELEASE
       - name: Build RDHost.exe
-        run: powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
       - name: Test
         run: swift test
       - uses: actions/upload-artifact@v4
