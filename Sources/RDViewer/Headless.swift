@@ -3,7 +3,7 @@ import RDCore
 
 /// GUI なしで接続し、受信状況を表示する (動作確認用・Linux 用)
 ///   RDViewer --headless <host> [port] [--pair CODE] [--frames N] [--out screen.ppm]
-///   RDViewer --headless --relay URL [--pair CODE | --host 指紋の先頭] [--frames N]
+///   RDViewer --headless --relay URL [--relay-transport auto|websocket|http] [--pair CODE | --host 指紋の先頭] [--frames N]
 func runHeadless(_ arguments: [String]) -> Never {
     var positional: [String] = []
     var maxFrames = Int.max
@@ -20,6 +20,12 @@ func runHeadless(_ arguments: [String]) -> Never {
         case "--data-dir": DataDirectory.overridePath = it.next()
         case "--relay": relay = it.next().flatMap(URL.init(string:))
         case "--host": hostQuery = it.next()
+        case "--relay-transport":
+            guard let m = it.next().flatMap(RelayTransportMode.init(rawValue:)) else {
+                print("--relay-transport には auto / websocket / http のどれかを指定してください")
+                exit(1)
+            }
+            RelayTransportMode.default = m
         case "--pair":
             guard let c = it.next().flatMap(PairingCode.parse) else {
                 print("ペアリングコードの形式が正しくありません")

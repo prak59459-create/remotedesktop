@@ -37,9 +37,22 @@ final class ViewerSession: ObservableObject {
 
     // MARK: 保存済み設定
 
+    /// ペアリングした PC の公開鍵。アプリを入れ直す (更新する) と UserDefaults は消えるので、キーチェーンにも置く
     static var savedHostKey: [UInt8]? {
-        get { UserDefaults.standard.string(forKey: "hostKey").flatMap(Fingerprint.fromHex) }
-        set { UserDefaults.standard.set(newValue.map(Fingerprint.hex), forKey: "hostKey") }
+        get {
+            if let k = UserDefaults.standard.string(forKey: "hostKey").flatMap(Fingerprint.fromHex) { return k }
+            guard let k = (try? SecretStore.load(name: "paired_host_key")) ?? nil, k.count == 32 else { return nil }
+            UserDefaults.standard.set(Fingerprint.hex(k), forKey: "hostKey")
+            return k
+        }
+        set {
+            UserDefaults.standard.set(newValue.map(Fingerprint.hex), forKey: "hostKey")
+            if let k = newValue {
+                try? SecretStore.save(name: "paired_host_key", bytes: k)
+            } else {
+                try? SecretStore.delete(name: "paired_host_key")
+            }
+        }
     }
 
     static var savedHostFingerprint: String? { savedHostKey.map(Fingerprint.display) }

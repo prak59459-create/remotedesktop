@@ -27,9 +27,14 @@ docker run -d --name rd-relay --restart unless-stopped --read-only --cap-drop AL
 
 ```
 relay.example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8080 {
+        # HTTP の通り道 (/h/recv) の応答を溜め込まずにすぐ流す
+        flush_interval -1
+    }
 }
 ```
+
+nginx など別のリバースプロキシを使う場合は、WebSocket の upgrade を通すことに加えて、応答のバッファリングを切ってください（nginx なら `proxy_buffering off;`。中継サーバーは `X-Accel-Buffering: no` も付けます）。溜め込む設定のままでも、端末はロングポーリングに切り替えて動きますが、遅延が増えます。
 
 4. RDHost と iPad アプリの中継サーバー URL を `https://relay.example.com` にする
 

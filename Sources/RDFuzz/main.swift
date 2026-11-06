@@ -21,7 +21,7 @@ public func rdFuzz(_ start: UnsafePointer<UInt8>, _ count: Int) -> CInt {
     guard count > 0 else { return 0 }
     let selector = start[0]
     let data = Array(UnsafeBufferPointer(start: start + 1, count: count - 1))
-    fuzzOne(selector % 9, data)
+    fuzzOne(selector % 10, data)
     return 0
 }
 
@@ -61,6 +61,8 @@ func fuzzOne(_ target: UInt8, _ data: [UInt8]) {
     case 7: // WebSocket フレーム (中継サーバー → 端末)
         var offset = 0
         _ = try? PlainWebSocketFuzz.read(data, &offset)
+    case 9: // HTTP 中継の下りストリームのフレーム (中継サーバー → 端末)
+        HTTPRelayFrameFuzz.run(data)
     default: // ペアリングコード・Base32・指紋
         let s = String(decoding: data, as: UTF8.self)
         _ = PairingCode.parse(s)

@@ -43,6 +43,82 @@ public enum RelayRoom {
     }
 }
 
+/// 中継サーバーへの通り道の選び方
+public enum RelayTransportMode: String, CaseIterable {
+    /// WebSocket を試し、つながらなければ HTTP (一度 HTTP に切り替わったら、以降は HTTP を先に試す)
+    case auto
+    case webSocket = "websocket"
+    /// 普通の HTTP リクエストだけ (WebSocket を通さないプロキシや社内ネットワーク向け)
+    case http
+
+    /// 既定の選び方 (アプリやコマンドラインのオプションで変える)
+    public static var `default`: RelayTransportMode {
+        get { lock.lock(); defer { lock.unlock() }; return _default }
+        set { lock.lock(); _default = newValue; lock.unlock() }
+    }
+
+    private static let lock = NSLock()
+    private static var _default: RelayTransportMode = .auto
+    private static var _preferHTTP = false
+
+    /// auto のとき、前回 WebSocket がつながらず HTTP でつながったか
+    static var preferHTTP: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _preferHTTP }
+        set { lock.lock(); _preferHTTP = newValue; lock.unlock() }
+    }
+}
+
+/// 受信スレッドが受け取ったバイト列を貯めて、receive(exactly:) で渡す
+final class ByteInbox {
+    struct Timeout: Error {}
+
+    private let cond = NSCondition()
+    private var buffer: [UInt8] = []
+    private var offset = 0
+    private var finished = false
+    private var timeout: Double = 0
+    static let maxBuffered = 32 * 1024 * 1024
+
+    /// 貯める。受信側が読まないまま溜まりすぎたら false (呼び出し側が切断する)
+    func append(_ b: [UInt8]) -> Bool {
+        cond.lock()
+        defer { cond.unlock() }
+        // 読み終えた部分を捨てる (受信側が少しでも遅れていると、ここで詰めないと際限なく増える)
+        if offset > 0 && (offset == buffer.count || offset >= 1 << 20) {
+            buffer.removeFirst(offset)
+            offset = 0
+        }
+        buffer += b
+        cond.broadcast()
+        return buffer.count - offset <= Self.maxBuffered
+    }
+
+    func finish() {
+        cond.lock(); finished = true; cond.broadcast(); cond.unlock()
+    }
+
+    func setTimeout(_ seconds: Double) {
+        cond.lock(); timeout = seconds; cond.unlock()
+    }
+
+    func receive(exactly n: Int) throws -> [UInt8] {
+        cond.lock()
+        defer { cond.unlock() }
+        let deadline = timeout > 0 ? Date().addingTimeInterval(timeout) : nil
+        while buffer.count - offset < n {
+            if finished { throw NetError.closed }
+            if let d = deadline {
+                if !cond.wait(until: d) && buffer.count - offset < n { throw Timeout() }
+            } else {
+                cond.wait()
+            }
+        }
+        let out = Array(buffer[offset ..< offset + n])
+        offset += n
+        return out
+    }
+}
+
 /// WebSocket を Transport (バイトストリーム) として使う。受信は専用スレッドで読み、タイムアウトを扱えるようにする。
 public final class RelayTransport: Transport {
     public let peerDescription: String
@@ -50,12 +126,7 @@ public final class RelayTransport: Transport {
     public var isLocalNetwork: Bool { false }
 
     private let ws: WebSocketConnection
-    private let cond = NSCondition()
-    private var buffer: [UInt8] = []
-    private var offset = 0
-    private var finished = false
-    private var timeout: Double = 0
-    static let maxBuffered = 32 * 1024 * 1024
+    private let inbox = ByteInbox()
 
     init(ws: WebSocketConnection, peer: String, peerIP: String) {
         self.ws = ws
@@ -73,27 +144,14 @@ public final class RelayTransport: Transport {
                 break
             }
             guard case .binary(let b) = msg else { break } // データ経路はバイナリだけ
-            cond.lock()
-            // 読み終えた部分を捨てる (受信側が少しでも遅れていると、ここで詰めないと際限なく増える)
-            if offset > 0 && (offset == buffer.count || offset >= 1 << 20) {
-                buffer.removeFirst(offset)
-                offset = 0
-            }
-            buffer += b
-            let over = buffer.count - offset > Self.maxBuffered
-            cond.broadcast()
-            cond.unlock()
-            if over { break }
+            if !inbox.append(b) { break }
         }
-        cond.lock()
-        finished = true
-        cond.broadcast()
-        cond.unlock()
+        inbox.finish()
         ws.close()
     }
 
     public func setReceiveTimeout(_ seconds: Double) {
-        cond.lock(); timeout = seconds; cond.unlock()
+        inbox.setTimeout(seconds)
     }
 
     public func sendAll(_ bytes: [UInt8]) throws {
@@ -101,31 +159,44 @@ public final class RelayTransport: Transport {
     }
 
     public func receive(exactly n: Int) throws -> [UInt8] {
-        cond.lock()
-        defer { cond.unlock() }
-        let deadline = timeout > 0 ? Date().addingTimeInterval(timeout) : nil
-        while buffer.count - offset < n {
-            if finished { throw NetError.closed }
-            if let d = deadline {
-                if !cond.wait(until: d) && buffer.count - offset < n {
-                    ws.close()
-                    throw NetError.io("受信タイムアウト")
-                }
-            } else {
-                cond.wait()
-            }
+        do {
+            return try inbox.receive(exactly: n)
+        } catch is ByteInbox.Timeout {
+            ws.close()
+            throw NetError.io("受信タイムアウト")
         }
-        let out = Array(buffer[offset ..< offset + n])
-        offset += n
-        return out
     }
 
     public func close() { ws.close() }
 
     // MARK: ビューア側
 
-    /// 中継サーバー経由でホストの部屋に接続する
-    public static func connect(relay: URL, room: String) throws -> RelayTransport {
+    /// 中継サーバー経由でホストの部屋に接続する。mode が auto なら WebSocket、だめなら HTTP
+    public static func connect(relay: URL, room: String,
+                               mode: RelayTransportMode = .default) throws -> Transport {
+        switch mode {
+        case .webSocket: return try connectWebSocket(relay: relay, room: room)
+        case .http: return try HTTPRelayTransport.connect(relay: relay, room: room)
+        case .auto:
+            let order: [RelayTransportMode] = RelayTransportMode.preferHTTP ? [.http, .webSocket] : [.webSocket, .http]
+            var firstError: Error?
+            for m in order {
+                do {
+                    let t = try connect(relay: relay, room: room, mode: m)
+                    RelayTransportMode.preferHTTP = m == .http
+                    return t
+                } catch let e as RelayError {
+                    // HTTP で中継サーバーには届いた (PC がオフラインなど)。通り道を変えても同じなので、この理由を返す
+                    throw e
+                } catch {
+                    if firstError == nil { firstError = error }
+                }
+            }
+            throw firstError ?? NetError.closed
+        }
+    }
+
+    static func connectWebSocket(relay: URL, room: String) throws -> RelayTransport {
         let url = try RelayRoom.url(relay, path: "/connect", query: ["room": room])
         let ws = try WebSocketClient.connect(url)
         return RelayTransport(ws: ws, peer: "relay:\(relay.host ?? "?")", peerIP: "relay")
@@ -133,20 +204,29 @@ public final class RelayTransport: Transport {
 }
 
 /// ホスト側: 中継サーバーに待ち受けを登録し、ビューアが来たら Transport を渡す。切れたら自動で再接続する。
+/// 通り道は WebSocket か HTTP (ロングポーリング)。auto なら WebSocket がつながらないときに HTTP を使う。
 public final class RelayHostListener {
     public let relay: URL
     public let room: String
+    public let mode: RelayTransportMode
     private let log: (String) -> Void
     private var stopped = false
     private let lock = NSLock()
     private var control: WebSocketConnection?
+    private var backoff = 2.0
 
     private let token: [UInt8]
 
-    public init(relay: URL, roomToken: [UInt8], log: @escaping (String) -> Void) {
+    /// 最初の接続そのものに失敗した (通り道の問題かもしれないので、auto ならもう一方を試す)
+    private struct ConnectFailed: Error {
+        let underlying: Error
+    }
+
+    public init(relay: URL, roomToken: [UInt8], mode: RelayTransportMode = .default, log: @escaping (String) -> Void) {
         self.relay = relay
         token = roomToken
         room = RelayRoom.id(token: roomToken)
+        self.mode = mode
         self.log = log
     }
 
@@ -165,25 +245,49 @@ public final class RelayHostListener {
 
     /// ブロッキングで動き続ける。onIncoming は新しいスレッドで呼ばれる。
     public func run(onIncoming: @escaping (Transport) -> Void) {
-        var backoff = 2.0
+        var useHTTP = mode == .http || (mode == .auto && RelayTransportMode.preferHTTP)
         while !isStopped {
             do {
-                let ws = try WebSocketClient.connect(try RelayRoom.url(relay, path: "/host", query: ["room": room]))
-                // トークンは URL に入れない (中継サーバーやプロキシのアクセスログに残さないため)
-                try ws.send(.text("{\"t\":\"auth\",\"token\":\"\(Fingerprint.hex(token))\"}"))
-                lock.lock(); control = ws; lock.unlock()
-                log("RELAY_UP relay=\(relay.host ?? "?")")
-                backoff = 2
-                try serve(ws, onIncoming: onIncoming)
+                do {
+                    try useHTTP ? serveHTTP(onIncoming) : serveWebSocket(onIncoming)
+                } catch let e as ConnectFailed where mode == .auto {
+                    // つながらなかった。もう一方の通り道を試す
+                    log("RELAY_FALLBACK from=\(useHTTP ? "http" : "websocket") error=\(e.underlying)")
+                    useHTTP.toggle()
+                    RelayTransportMode.preferHTTP = useHTTP
+                    try useHTTP ? serveHTTP(onIncoming) : serveWebSocket(onIncoming)
+                }
             } catch {
                 if isStopped { break }
-                log("RELAY_DOWN error=\(error) retry_in=\(Int(backoff))s")
+                let e = (error as? ConnectFailed)?.underlying ?? error
+                log("RELAY_DOWN error=\(e) retry_in=\(Int(backoff))s")
             }
             lock.lock(); control = nil; lock.unlock()
             if isStopped { break }
             Thread.sleep(forTimeInterval: backoff)
             backoff = min(backoff * 2, 60)
         }
+    }
+
+    private func up(_ transport: String) {
+        log("RELAY_UP relay=\(relay.host ?? "?") transport=\(transport)")
+        backoff = 2
+    }
+
+    // MARK: WebSocket
+
+    private func serveWebSocket(_ onIncoming: @escaping (Transport) -> Void) throws {
+        let ws: WebSocketConnection
+        do {
+            ws = try WebSocketClient.connect(try RelayRoom.url(relay, path: "/host", query: ["room": room]))
+        } catch {
+            throw ConnectFailed(underlying: error)
+        }
+        // トークンは URL に入れない (中継サーバーやプロキシのアクセスログに残さないため)
+        try ws.send(.text("{\"t\":\"auth\",\"token\":\"\(Fingerprint.hex(token))\"}"))
+        lock.lock(); control = ws; lock.unlock()
+        up("websocket")
+        try serve(ws, onIncoming: onIncoming)
     }
 
     private func serve(_ ws: WebSocketConnection, onIncoming: @escaping (Transport) -> Void) throws {
@@ -220,22 +324,77 @@ public final class RelayHostListener {
                 continue
             }
             guard text.utf8.count <= 512,
-                  let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-                  obj["t"] as? String == "incoming",
-                  let id = obj["id"] as? String, id.count == 32,
-                  id.allSatisfy({ $0.isHexDigit }) else { continue }
-            // ip は中継サーバーの申告 (信用はしない。レート制限のキーにだけ使う)
-            let ip = sanitize((obj["ip"] as? String) ?? "?", maxLength: 64)
-            let relay = self.relay, room = self.room, log = self.log
-            Thread {
-                do {
+                  let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { continue }
+            incoming(obj, http: false, onIncoming)
+        }
+    }
+
+    // MARK: HTTP (ロングポーリング)
+
+    private func serveHTTP(_ onIncoming: @escaping (Transport) -> Void) throws {
+        let client: HTTPClient
+        do {
+            client = try HTTPClient(base: relay)
+        } catch {
+            throw ConnectFailed(underlying: error)
+        }
+        // この起動ごとの ID。中継サーバーは、同じ部屋を別の RDHost (二重起動) が取ろうとしたのを見分ける
+        var rng = SystemRandomNumberGenerator()
+        let hid = Fingerprint.hex((0 ..< 16).map { _ in UInt8.random(in: 0 ... 255, using: &rng) })
+        // トークンは URL に入れず本文で送る (アクセスログに残さないため)
+        let body = Array("{\"t\":\"auth\",\"token\":\"\(Fingerprint.hex(token))\",\"hid\":\"\(hid)\"}".utf8)
+        var isUp = false
+        while !isStopped {
+            let status: Int
+            let resp: [UInt8]
+            do {
+                // サーバーは最長 20 秒待たせてから返す
+                (status, resp) = try client.request("POST", path: "/h/host", query: ["room": room], body: body,
+                                                    timeout: 40)
+            } catch {
+                throw isUp ? error : ConnectFailed(underlying: error)
+            }
+            switch status {
+            case 200: break
+            case 403: throw RelayError.badToken
+            case 409: throw RelayError.roomInUse
+            case 429: throw RelayError.busy
+            default: throw isUp ? RelayError.status(status) : ConnectFailed(underlying: RelayError.status(status))
+            }
+            if !isUp {
+                isUp = true
+                up("http")
+            }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(resp)) as? [String: Any],
+                  let events = obj["events"] as? [[String: Any]] else {
+                throw HTTPError.protocolViolation("イベントの形式が不正")
+            }
+            for e in events.prefix(16) { incoming(e, http: true, onIncoming) }
+        }
+    }
+
+    // MARK: 共通
+
+    /// 「ビューアが来た」通知を受けて、そのセッションを受け取る
+    private func incoming(_ obj: [String: Any], http: Bool, _ onIncoming: @escaping (Transport) -> Void) {
+        guard obj["t"] as? String == "incoming",
+              let id = obj["id"] as? String, id.count == 32,
+              id.allSatisfy({ $0.isHexDigit }) else { return }
+        // ip は中継サーバーの申告 (信用はしない。レート制限のキーにだけ使う)
+        let ip = sanitize((obj["ip"] as? String) ?? "?", maxLength: 64)
+        let relay = self.relay, room = self.room, log = self.log
+        Thread {
+            do {
+                if http {
+                    onIncoming(try HTTPRelayTransport.accept(relay: relay, room: room, id: id, peerIP: ip))
+                } else {
                     let url = try RelayRoom.url(relay, path: "/accept", query: ["room": room, "id": id])
                     let dws = try WebSocketClient.connect(url)
                     onIncoming(RelayTransport(ws: dws, peer: "relay:\(ip)", peerIP: "relay:\(ip)"))
-                } catch {
-                    log("RELAY_ACCEPT_FAIL error=\(error)")
                 }
-            }.start()
-        }
+            } catch {
+                log("RELAY_ACCEPT_FAIL error=\(error)")
+            }
+        }.start()
     }
 }

@@ -160,3 +160,190 @@ test('many sessions in a row are not blocked by the per-IP limit', async () => {
   }
   h.ws.close();
 });
+
+// MARK: - HTTP の通り道
+
+function req(method, path, body) {
+  const u = new URL(base.replace('ws://', 'http://') + path);
+  return new Promise((resolve, reject) => {
+    const r = require('http').request(u, { method, agent: false }, (res) => {
+      const parts = [];
+      res.on('data', (d) => parts.push(d));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
+    });
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
+  });
+}
+const post = (path, body) => req('POST', path, body);
+const getJSON = (r) => JSON.parse(r.body.toString());
+
+/** ストリームの下り。フレームを読んで貯める */
+function openStream(leg) {
+  const u = new URL(base.replace('ws://', 'http://') + `/h/recv?leg=${leg}&mode=stream`);
+  return new Promise((resolve, reject) => {
+    const r = require('http').get(u, { agent: false }, (res) => {
+      const s = { res, frames: [], waiters: [], buf: Buffer.alloc(0), ended: false, status: res.statusCode };
+      const push = (f) => {
+        const w = s.waiters.shift();
+        if (w) w(f);
+        else s.frames.push(f);
+      };
+      res.on('data', (d) => {
+        s.buf = Buffer.concat([s.buf, d]);
+        while (s.buf.length >= 4) {
+          const n = s.buf.readUInt32BE(0);
+          if (n === 0xffffffff) {
+            s.buf = s.buf.subarray(4);
+            push('closed');
+            continue;
+          }
+          if (s.buf.length < 4 + n) break;
+          push(n === 0 ? 'keepalive' : s.buf.subarray(4, 4 + n));
+          s.buf = s.buf.subarray(4 + n);
+        }
+      });
+      res.on('end', () => push('end'));
+      s.next = () => (s.frames.length ? Promise.resolve(s.frames.shift()) : new Promise((r2) => s.waiters.push(r2)));
+      s.close = () => r.destroy();
+      resolve(s);
+    });
+    r.on('error', reject);
+  });
+}
+
+/** HTTP のホスト。ポーリングを 1 回投げて、そのイベント待ちを返す */
+function hostPoll(token, hid) {
+  return post('/h/host?room=' + roomFromToken(token), JSON.stringify({ t: 'auth', token, hid }));
+}
+const newHid = () => crypto.randomBytes(16).toString('hex');
+
+test('http: host auth and room ownership', async () => {
+  const token = newToken();
+  const room = roomFromToken(token);
+  // 違うトークン・壊れた本文
+  assert.strictEqual((await post('/h/host?room=' + room, JSON.stringify({ t: 'auth', token: newToken(), hid: newHid() }))).status, 403);
+  assert.strictEqual((await post('/h/host?room=' + room, 'nope')).status, 400);
+  assert.strictEqual((await post('/h/host?room=short', '{}')).status, 400);
+  assert.strictEqual((await req('GET', '/h/host?room=' + room)).status, 405);
+  // 部屋は登録されていない
+  assert.strictEqual((await post('/h/connect?room=' + room)).status, 404);
+
+  // 正しいトークンで登録。最初の応答はすぐ返る (登録できたことの通知)
+  const hid = newHid();
+  const reg = await hostPoll(token, hid);
+  assert.strictEqual(reg.status, 200);
+  assert.deepStrictEqual(getJSON(reg).events, []);
+  // 2 回目からはイベントを待たせる
+  const first = hostPoll(token, hid);
+  await new Promise((r) => setTimeout(r, 50));
+  // 別のホスト (hid が違う) は同じ部屋を取れない。WebSocket のホストも同じ
+  assert.strictEqual((await hostPoll(token, newHid())).status, 409);
+  const ws = await open('/host?room=' + room);
+  ws.send(JSON.stringify({ t: 'auth', token }));
+  assert.strictEqual(await closed(ws), 4009);
+
+  // ビューアが来るとポーリングが返る
+  const v = await post('/h/connect?room=' + room);
+  assert.strictEqual(v.status, 200);
+  const r = await first;
+  assert.strictEqual(r.status, 200);
+  const ev = getJSON(r).events;
+  assert.strictEqual(ev.length, 1);
+  assert.strictEqual(ev[0].t, 'incoming');
+  assert.match(ev[0].id, /^[0-9a-f]{32}$/);
+  await post(`/h/close?leg=${getJSON(v).leg}`);
+});
+
+test('http: viewer and host relay bytes both ways (stream down, numbered posts up)', async () => {
+  const token = newToken();
+  const room = roomFromToken(token);
+  const hid = newHid();
+  assert.strictEqual((await hostPoll(token, hid)).status, 200);
+  const poll = hostPoll(token, hid);
+  await new Promise((r) => setTimeout(r, 50));
+  const v = getJSON(await post('/h/connect?room=' + room)).leg;
+  // 受け取られる前に送ったデータも届く
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.from([1, 2, 3]))).status, 204);
+  const id = getJSON(await poll).events[0].id;
+  assert.strictEqual((await post(`/h/accept?room=${room}&id=${'0'.repeat(32)}`)).status, 404);
+  const acc = await post(`/h/accept?room=${room}&id=${id}`);
+  assert.strictEqual(acc.status, 200);
+  const h = getJSON(acc).leg;
+  // ID は 1 回限り
+  assert.strictEqual((await post(`/h/accept?room=${room}&id=${id}`)).status, 404);
+
+  const hs = await openStream(h);
+  assert.strictEqual(hs.status, 200);
+  assert.strictEqual(await hs.next(), 'keepalive');
+  // /h/ready の前はデータを流さない
+  assert.strictEqual((await post(`/h/ready?leg=${h}`)).status, 204);
+  assert.deepStrictEqual([...(await hs.next())], [1, 2, 3]);
+  // ストリームは 1 本だけ
+  assert.strictEqual((await openStream(h)).status, 409);
+
+  const vs = await openStream(v);
+  assert.strictEqual(await vs.next(), 'keepalive');
+  await post(`/h/ready?leg=${v}`);
+  await post(`/h/send?leg=${h}&seq=1`, Buffer.from([9]));
+  assert.deepStrictEqual([...(await vs.next())], [9]);
+
+  // 同じ番号の再送は無視、番号の飛びは切断
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.from([7]))).status, 204);
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=2`, Buffer.from([8]))).status, 204);
+  assert.deepStrictEqual([...(await hs.next())], [8]);
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=9`, Buffer.from([8]))).status, 409);
+  assert.strictEqual(await vs.next(), 'closed');
+  assert.strictEqual(await hs.next(), 'closed');
+  assert.strictEqual((await post(`/h/send?leg=${h}&seq=2`, Buffer.from([1]))).status, 410);
+});
+
+test('http: poll fallback when the stream is held back; mixed with a WebSocket host', async () => {
+  const h = await host(newToken()); // ホストは WebSocket
+  const v = getJSON(await post('/h/connect?room=' + h.room)).leg;
+  const inc = JSON.parse((await next(h.ws)).d.toString());
+  const acc = await open(`/accept?room=${h.room}&id=${inc.id}`);
+
+  // ストリームを開いたが ready を送らずに諦めた (溜め込むプロキシを想定)
+  const vs = await openStream(v);
+  assert.strictEqual(await vs.next(), 'keepalive');
+  acc.send(Buffer.from([5, 6]));
+  vs.close();
+  await new Promise((r) => setTimeout(r, 50));
+  // poll では取りこぼさずに受け取れる。同じ番号の再要求には同じ中身
+  let r = await req('GET', `/h/recv?leg=${v}&mode=poll&seq=1`);
+  assert.deepStrictEqual([...r.body], [5, 6]);
+  r = await req('GET', `/h/recv?leg=${v}&mode=poll&seq=1`);
+  assert.deepStrictEqual([...r.body], [5, 6]);
+  // 待っている間に届いたデータで返る
+  const waiting = req('GET', `/h/recv?leg=${v}&mode=poll&seq=2`);
+  await new Promise((r2) => setTimeout(r2, 50));
+  acc.send(Buffer.from([7]));
+  assert.deepStrictEqual([...(await waiting).body], [7]);
+  // 番号の飛びは拒否
+  assert.strictEqual((await req('GET', `/h/recv?leg=${v}&mode=poll&seq=5`)).status, 409);
+  // 上りも届く
+  await post(`/h/send?leg=${v}&seq=1`, Buffer.from([1]));
+  assert.deepStrictEqual([...(await next(acc)).d], [1]);
+
+  // ホスト側が切ると、ビューアの poll は 410
+  acc.close();
+  await closed(acc);
+  await new Promise((r2) => setTimeout(r2, 50));
+  assert.strictEqual((await req('GET', `/h/recv?leg=${v}&mode=poll&seq=3`)).status, 410);
+  h.ws.close();
+});
+
+test('http: unknown legs, oversized posts and leg ids are not guessable', async () => {
+  assert.strictEqual((await post(`/h/send?leg=${'0'.repeat(32)}&seq=1`, Buffer.from([1]))).status, 410);
+  assert.strictEqual((await req('GET', `/h/recv?leg=zz&mode=poll&seq=1`)).status, 410);
+  const h = await host(newToken());
+  const v = getJSON(await post('/h/connect?room=' + h.room)).leg;
+  assert.match(v, /^[0-9a-f]{32}$/);
+  await next(h.ws);
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=0`, Buffer.from([1]))).status, 400);
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.alloc(config.maxSendBody + 1))).status, 413);
+  assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.from([1]))).status, 410);
+  h.ws.close();
+});
