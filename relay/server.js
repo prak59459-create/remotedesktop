@@ -93,6 +93,12 @@ function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
+/** 断った接続の調査用 (中身・IP・部屋 ID は残さない) */
+function describeReq(req) {
+  const ua = String(req.headers['user-agent'] || '-').slice(0, 80);
+  return `http/${req.httpVersion} via=${req.headers.via ? 'yes' : 'no'} ua="${ua}"`;
+}
+
 function admit(ip) {
   const now = Date.now();
   const list = (recentConns.get(ip) || []).filter((t) => now - t < 60000);
@@ -206,7 +212,11 @@ function handleHost(ws, room, ip) {
 
 function handleConnect(ws, room, ip) {
   const state = rooms.get(room);
-  if (!state || state.host.readyState !== 1) return ws.close(4004, 'host offline');
+  if (!state || state.host.readyState !== 1) {
+    log('viewer: host offline', room.slice(0, 4) + '…');
+    return ws.close(4004, 'host offline');
+  }
+  log('viewer', room.slice(0, 4) + '…');
   if (state.pending.size >= config.maxPendingPerRoom) return ws.close(4029, 'too many pending');
   if (activeSessions >= config.maxSessions) return ws.close(4029, 'server full');
 
@@ -279,6 +289,13 @@ const wss = new WebSocketServer({
   perMessageDeflate: false, // 暗号文は圧縮できない。圧縮系の攻撃面も減らす
 });
 
+// WebSocket の開始手順が不正 (ヘッダーの欠落など。途中のプロキシやフィルターが書き換えた場合も含む)
+wss.on('wsClientError', (err, socket, req) => {
+  log('reject handshake', String(err && err.message).slice(0, 80), describeReq(req));
+  if (socket.writable) socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  socket.destroy();
+});
+
 server.on('upgrade', (req, socket, head) => {
   const ip = clientIP(req);
   let url;
@@ -294,6 +311,7 @@ server.on('upgrade', (req, socket, head) => {
     ROOM_RE.test(room) &&
     (kind === '/host' || kind === '/connect' || (kind === '/accept' && ID_RE.test(id)));
   if (!valid) {
+    log('reject 400', kind.slice(0, 16), ROOM_RE.test(room) ? 'room=ok' : 'room=bad', describeReq(req));
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }

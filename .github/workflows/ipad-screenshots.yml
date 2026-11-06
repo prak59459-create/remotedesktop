@@ -7,6 +7,7 @@ on:
     paths:
       - "ipad/**"
       - "scripts/ipad-screenshots.sh"
+      - "relay/**"
       - ".github/workflows/ipad-screenshots.yml"
 
 permissions:
@@ -22,6 +23,9 @@ jobs:
           persist-credentials: false
       - name: Take screenshots
         run: ./scripts/ipad-screenshots.sh screenshots
+        env:
+          # iPad (シミュレーター) から実際の中継サーバーにつなげるかも確かめる
+          RD_SHOT_RELAY_URL: https://remotedesktop-relay-wjks.onrender.com
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

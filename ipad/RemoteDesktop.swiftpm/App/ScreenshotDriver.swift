@@ -137,6 +137,26 @@ final class ScreenshotDriver: ObservableObject {
             session.disconnect()
         }
 
+        // 14. 外出先 (中継サーバー経由) で接続 (RD_SHOT_RELAY_REAL があるときだけ。実際の中継サーバーを使う)
+        if let real = env["RD_SHOT_RELAY_REAL"], !real.isEmpty {
+            await wait(2)
+            d.set("外出先 (中継)", forKey: "mode")
+            d.set(real, forKey: "relayURL")
+            await wait(1)
+            pressConnect.send()
+            await wait(2.5)
+            await shot("14-relay-auth")
+            if await until(60, { session.phase == .connected }) {
+                await wait(3)
+                await shot("15-relay-connected")
+                try? Data().write(to: dir.appendingPathComponent("relay-ok"))
+                session.disconnect()
+            } else {
+                await wait(1)
+                await shot("15-relay-failed")
+            }
+        }
+
         try? Data().write(to: dir.appendingPathComponent("finished"))
     }
 

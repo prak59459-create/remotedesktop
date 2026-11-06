@@ -53,6 +53,7 @@ IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
 echo "ホストの IP: $IP"
 RD_TEST_AUTO_APPROVE=1 RD_TEST_LOOPBACK_IS_LAN=1 \
   script -q "$WORK/host.log" .build/debug/RDHost --pair --port 5999 --data-dir "$WORK/host" --idle-timeout 30 \
+  ${RD_SHOT_RELAY_URL:+--relay "$RD_SHOT_RELAY_URL"} \
   < /dev/null > /dev/null 2>&1 &
 HOST_PID=$!
 for _ in $(seq 120); do grep -q 'ペアリングコード:' "$WORK/host.log" 2>/dev/null && break; sleep 1; done
@@ -65,7 +66,7 @@ xcrun simctl spawn "$UDID" notifyutil -p com.apple.BiometricKit.enrollmentChange
 
 echo "== 起動して撮影"
 SIMCTL_CHILD_RD_SHOT_HOST="$IP" SIMCTL_CHILD_RD_SHOT_PORT=5999 SIMCTL_CHILD_RD_SHOT_CODE="$CODE" \
-SIMCTL_CHILD_RD_SHOT_RELAY="https://my-relay.onrender.com" \
+SIMCTL_CHILD_RD_SHOT_RELAY="https://my-relay.onrender.com" SIMCTL_CHILD_RD_SHOT_RELAY_REAL="${RD_SHOT_RELAY_URL:-}" \
   xcrun simctl launch "$UDID" "$BUNDLE"
 sleep 2
 SHOTS="$(xcrun simctl get_app_container "$UDID" "$BUNDLE" data)/Documents/shots"
@@ -91,6 +92,9 @@ if [ -f "$SHOTS/used-bonjour" ]; then
   echo "== Bonjour で見つけた「$(cat "$SHOTS/used-bonjour")」に名前で接続しました"
 else
   echo "== Bonjour では見つからず、IP アドレスで接続しました"
+fi
+if [ -n "${RD_SHOT_RELAY_URL:-}" ]; then
+  if [ -f "$SHOTS/relay-ok" ]; then echo "== 中継サーバー経由の接続: 成功"; else echo "== 中継サーバー経由の接続: 失敗 (15-relay-failed.png を参照)"; fi
 fi
 echo "== ホストが受け取った入力"
 grep -a '\[input\]' "$WORK/host.log" | tr -d '\r' | head -20 || true
