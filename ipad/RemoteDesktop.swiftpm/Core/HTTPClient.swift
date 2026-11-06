@@ -296,7 +296,7 @@ final class WinHTTPSession {
         let sent = winString(headers) { h in
             payload.withUnsafeMutableBytes { p in
                 WinHttpSendRequest(r, headers.isEmpty ? nil : h, headers.isEmpty ? 0 : DWORD(headers.utf16.count),
-                                   payload.isEmpty ? nil : p.baseAddress, DWORD(p.count), DWORD(p.count), 0)
+                                   p.count == 0 ? nil : p.baseAddress, DWORD(p.count), DWORD(p.count), 0)
             }
         }
         guard sent, WinHttpReceiveResponse(r, nil) else {
