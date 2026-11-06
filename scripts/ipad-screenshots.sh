@@ -18,18 +18,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== ホストをビルドして起動"
+echo "== ホストをビルド"
 swift build --product RDHost
-IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
-[ -n "$IP" ] || IP=127.0.0.1
-echo "ホストの IP: $IP"
-RD_TEST_AUTO_APPROVE=1 RD_TEST_LOOPBACK_IS_LAN=1 \
-  script -q "$WORK/host.log" .build/debug/RDHost --pair --port 5999 --data-dir "$WORK/host" --idle-timeout 30 \
-  < /dev/null > /dev/null 2>&1 &
-HOST_PID=$!
-for _ in $(seq 120); do grep -q 'ペアリングコード:' "$WORK/host.log" 2>/dev/null && break; sleep 1; done
-CODE="$(grep -o 'ペアリングコード: *[0-9A-Z-]*' "$WORK/host.log" | head -1 | sed -E 's/.*: *//')"
-[ -n "$CODE" ] || { echo "ペアリングコードが取れません"; cat "$WORK/host.log" || true; exit 1; }
 
 echo "== シミュレーターを起動"
 UDID="$(xcrun simctl list devices available -j | python3 -c '
@@ -56,6 +46,18 @@ echo "== iPad アプリをビルド (撮影用の自動操作つき)"
 APP="$(find "$WORK/dd/Build/Products" -maxdepth 2 -name 'RemoteDesktop.app' | head -1)"
 [ -n "$APP" ] || { echo "アプリが見つかりません"; exit 1; }
 xcrun simctl install "$UDID" "$APP"
+
+echo "== ホストを起動 (ペアリングコードは 10 分で切れるので、アプリのビルド後に起動する)"
+IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
+[ -n "$IP" ] || IP=127.0.0.1
+echo "ホストの IP: $IP"
+RD_TEST_AUTO_APPROVE=1 RD_TEST_LOOPBACK_IS_LAN=1 \
+  script -q "$WORK/host.log" .build/debug/RDHost --pair --port 5999 --data-dir "$WORK/host" --idle-timeout 30 \
+  < /dev/null > /dev/null 2>&1 &
+HOST_PID=$!
+for _ in $(seq 120); do grep -q 'ペアリングコード:' "$WORK/host.log" 2>/dev/null && break; sleep 1; done
+CODE="$(grep -o 'ペアリングコード: *[0-9A-Z-]*' "$WORK/host.log" | head -1 | sed -E 's/.*: *//')"
+[ -n "$CODE" ] || { echo "ペアリングコードが取れません"; cat "$WORK/host.log" || true; exit 1; }
 
 echo "== Face ID を登録済みにする (シミュレーターの機能。撮影後に「一致」を送って本人確認を通す)"
 xcrun simctl spawn "$UDID" notifyutil -s com.apple.BiometricKit.enrollmentChanged '1'
