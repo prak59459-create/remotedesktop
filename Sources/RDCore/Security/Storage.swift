@@ -384,8 +384,26 @@ public final class TrustStore {
         noiseHMAC(key: key, Array("RemoteDesktop trust store v1".utf8) + bytes)
     }
 
+    /// iPad: 一覧の写しをキーチェーンにも置く。アプリを入れ直す (更新する) とサンドボックス内のファイルは消えるが、
+    /// キーチェーン (端末の鍵もここにある) は残るので、ペアリングし直さずに済む。
+    private static func backupName(_ url: URL) -> String { "trust." + url.lastPathComponent }
+
+    private static var usesKeychainBackup: Bool {
+        #if os(iOS)
+        return SecretStore.useKeychain
+        #else
+        return false
+        #endif
+    }
+
     private static func load(_ url: URL, key: [UInt8]?) -> ([Entry], Bool) {
-        guard let data = SecureFile.read(url), !data.isEmpty else { return ([], false) }
+        var stored = SecureFile.read(url)
+        if (stored ?? []).isEmpty && usesKeychainBackup,
+           let backup = try? SecretStore.load(name: backupName(url)), !backup.isEmpty {
+            stored = backup
+            try? SecureFile.write(backup, to: url) // ファイルに戻しておく
+        }
+        guard let data = stored, !data.isEmpty else { return ([], false) }
         if let signed = try? decoder().decode(Signed.self, from: Data(data)) {
             let body = Array(signed.entries.utf8)
             if let key = key {
@@ -494,6 +512,9 @@ public final class TrustStore {
             try SecureFile.write([UInt8](try enc.encode(signed)), to: url)
         } else {
             try SecureFile.write([UInt8](body), to: url)
+        }
+        if Self.usesKeychainBackup, let data = SecureFile.read(url) {
+            try? SecretStore.save(name: Self.backupName(url), bytes: data)
         }
     }
 }
