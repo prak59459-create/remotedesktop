@@ -13,6 +13,7 @@ struct ConnectView: View {
     @AppStorage("lanHost") private var lanHost = ""
     @AppStorage("lanPort") private var lanPort = "5999"
     @AppStorage("relayURL") private var relayURL = ""
+    @AppStorage("relayTransport") private var relayTransportRaw = RelayTransportMode.auto.rawValue
     @AppStorage("lanService") private var lanService = "" // Bonjour で見つけて選んだ PC の名前
     @StateObject private var finder = HostFinder()
     @State private var pairingCode = ""
@@ -78,6 +79,15 @@ struct ConnectView: View {
                             .keyboardType(.URL)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                    }
+                    Section(header: Text("通り道"),
+                            footer: Text("自動: WebSocket を試し、つながらなければ普通の HTTP 通信に切り替えます。会社や公衆 Wi-Fi のプロキシでつながらないときは「HTTP」を選んでください。どれを選んでも通信は端末間で暗号化されます。")) {
+                        Picker("通り道", selection: $relayTransportRaw) {
+                            Text("自動").tag(RelayTransportMode.auto.rawValue)
+                            Text("WebSocket").tag(RelayTransportMode.webSocket.rawValue)
+                            Text("HTTP").tag(RelayTransportMode.http.rawValue)
+                        }
+                        .pickerStyle(.segmented)
                     }
                 }
 
@@ -154,6 +164,7 @@ struct ConnectView: View {
                 session.alert = .init(title: "中継サーバーの URL を確認してください", message: "https:// で始まる URL を入力してください。")
                 return
             }
+            RelayTransportMode.default = RelayTransportMode(rawValue: relayTransportRaw) ?? .auto
             session.connect(endpoint: .relay(url), pairingCode: nil)
         }
     }
