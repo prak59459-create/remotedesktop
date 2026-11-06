@@ -36,7 +36,15 @@ final class ScreenshotDriver: ObservableObject {
         // 1. 起動直後 (同じ Wi-Fi)
         d.set("同じ Wi-Fi", forKey: "mode")
         d.set("", forKey: "lanHost")
+        d.set("", forKey: "lanService")
         d.set("5999", forKey: "lanPort")
+        // Bonjour でホストが見つかるのを待つ (見つかった一覧が画面に出る)
+        let finder = HostBrowser()
+        var found: [String] = []
+        finder.onChange = { found = $0 }
+        finder.start()
+        _ = await until(20) { !found.isEmpty }
+        finder.stop()
         await wait(1)
         await shot("01-connect-empty")
 
@@ -55,7 +63,14 @@ final class ScreenshotDriver: ObservableObject {
 
         // 4. 同じ Wi-Fi で IP とペアリングコードを入力
         d.set("同じ Wi-Fi", forKey: "mode")
-        d.set(env["RD_SHOT_HOST"] ?? "", forKey: "lanHost")
+        if let name = found.first {
+            // 見つかった PC を選ぶ (Bonjour で名前を使って接続する)
+            d.set("", forKey: "lanHost")
+            d.set(name, forKey: "lanService")
+            try? Data(name.utf8).write(to: dir.appendingPathComponent("used-bonjour"))
+        } else {
+            d.set(env["RD_SHOT_HOST"] ?? "", forKey: "lanHost")
+        }
         d.set(env["RD_SHOT_PORT"] ?? "5999", forKey: "lanPort")
         await wait(1)
         pairingCode.send(env["RD_SHOT_CODE"] ?? "")

@@ -11,6 +11,8 @@ struct HostOptions {
     var confirm = false
     var relay: URL?
     var direct = true
+    /// 同じ LAN の iPad から見つけられるよう、Bonjour (DNS-SD) で PC の名前とポートを知らせる
+    var bonjour = true
     var allowRemotePairing = false
     /// 入力が無いまま、この秒数が過ぎたら切断する
     var idleTimeout: TimeInterval = 15 * 60

@@ -1,5 +1,6 @@
 #if os(Windows)
 import Dispatch
+import CWinSys
 import Foundation
 import WinSDK
 
@@ -345,6 +346,29 @@ func showConnectionIndicator(_ text: String?) {
 }
 
 func makeCapturer(scale: Int) -> ScreenCapturer? { GDICapturer(scale: scale) }
+
+func computerName() -> String {
+    ProcessInfo.processInfo.environment["COMPUTERNAME"] ?? "RDHost"
+}
+
+/// 同じ LAN に Bonjour (DNS-SD) で知らせる。失敗したら理由を返す。
+/// 受信には Windows 標準の mDNS (UDP 5353) が使われる。ネットワークが「パブリック」だと届かないことがある。
+func advertiseBonjour(name: String, port: UInt16, ip: String?) -> String? {
+    var ip4: UInt32 = 0
+    if let ip {
+        let parts = ip.split(separator: ".").compactMap { UInt32($0) }
+        if parts.count == 4 {
+            // ネットワークバイトオーダー (メモリ上で a.b.c.d の順)
+            ip4 = parts[0] | parts[1] << 8 | parts[2] << 16 | parts[3] << 24
+        }
+    }
+    let rc = "\(name).\(rdBonjourServiceTypeName).local".withCString(encodedAs: UTF16.self) { inst in
+        "\(name).local".withCString(encodedAs: UTF16.self) { host in
+            rd_mdns_register(inst, host, numericCast(ip4), port)
+        }
+    }
+    return rc == 0 ? nil : "Windows のエラー \(rc)"
+}
 func makeInjector() -> InputInjector { WindowsInputInjector() }
 func platformSetup() { enableDPIAwareness() }
 #endif

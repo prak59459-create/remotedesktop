@@ -85,6 +85,11 @@ while [ $SECONDS -lt $deadline ] && [ ! -f "$SHOTS/finished" ]; do
 done
 
 sleep 1
+if [ -f "$SHOTS/used-bonjour" ]; then
+  echo "== Bonjour で見つけた「$(cat "$SHOTS/used-bonjour")」に名前で接続しました"
+else
+  echo "== Bonjour では見つからず、IP アドレスで接続しました"
+fi
 echo "== ホストが受け取った入力"
 grep -a '\[input\]' "$WORK/host.log" | tr -d '\r' | head -20 || true
 ls -1 "$OUT"

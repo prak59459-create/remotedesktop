@@ -16,6 +16,7 @@ func usage() -> Never {
       --relay URL       中継サーバー経由でも待ち受ける (例: https://xxxx.onrender.com)
                         ルーターのポート開放は不要。中継サーバーには暗号文しか流れない
       --no-direct       直接接続 (TCP) の待ち受けをしない (中継のみ)
+      --no-bonjour      同じ Wi-Fi の iPad に、この PC の名前を知らせない (IP アドレスで接続する)
       --allow-remote-pairing  LAN 外 (中継経由・インターネット) からの端末登録も許可する (非推奨)
       --confirm         登録済みの端末でも、接続のたびにこの PC の画面で許可/拒否を確認する
                         (新しい端末の登録はこの指定にかかわらず必ず確認する)
@@ -59,6 +60,7 @@ while let a = args.next() {
         }
         options.relay = u
     case "--no-direct": options.direct = false
+    case "--no-bonjour": options.bonjour = false
     case "--allow-remote-pairing": options.allowRemotePairing = true
     case "--on-disconnect":
         guard let a = args.next().flatMap(DisconnectAction.init(rawValue:)) else {
@@ -217,6 +219,18 @@ if options.direct {
         exit(1)
     }
     print("直接接続: \(options.bindAddress ?? "0.0.0.0"):\(options.port) で待ち受け中")
+    let lanIP = options.bindAddress ?? Net.primaryLocalIPv4()
+    let pcName = computerName()
+    if options.bonjour, let l = listener {
+        if let err = advertiseBonjour(name: pcName, port: l.boundPort, ip: lanIP) {
+            print("※ Bonjour での公開に失敗しました (\(err))。iPad では IP アドレスで接続してください")
+        } else {
+            print("同じ Wi-Fi の iPad の接続画面に「\(pcName)」が表示されます")
+        }
+    }
+    if let ip = lanIP {
+        print("IP アドレスで接続する場合: \(ip)  ポート \(listener?.boundPort ?? options.port)")
+    }
 }
 if let relay = options.relay {
     if relay.scheme == "http" || relay.scheme == "ws" {
