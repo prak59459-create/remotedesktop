@@ -57,6 +57,7 @@ RDHost.exe --relay https://<名前>.onrender.com --confirm
 |---|---|
 | `--pair` | 新しい端末を登録するためのコードを表示（同じ Wi-Fi からのみ。登録時は画面で許可） |
 | `--relay URL` | 中継サーバー経由でも待ち受ける（ポート開放不要） |
+| `--relay-transport auto/websocket/http` | 中継サーバーへの通り道（既定 auto: WebSocket がつながらなければ普通の HTTP に自動で切り替え）。WebSocket を通さない会社のプロキシなどでは `http` |
 | `--no-direct` | 直接接続（TCP 5999）の待ち受けをしない |
 | `--no-bonjour` | 同じ Wi-Fi の iPad に PC の名前を知らせない（IP アドレスで接続） |
 | `--confirm` | 登録済みの端末でも、接続のたびに Windows 側で許可/拒否のダイアログを出す（外出先で使うなら付けない） |
@@ -74,7 +75,7 @@ RDHost.exe --relay https://<名前>.onrender.com --confirm
 
 1. このリポジトリの `ipad/RemoteDesktop.swiftpm` フォルダを iPad の「ファイル」に入れ（iCloud Drive など）、**Swift Playgrounds** で開いて実行します。
 2. **初回**: 「同じ Wi-Fi」を選び、「この Wi-Fi で見つかった PC」から PC を選んで（または IP アドレスを入力して）、ペアリングコードを入力して「接続」。Windows 側に出る確認ダイアログで「はい」を押し、iPad に表示されたホストの指紋が Windows 側の表示と同じか確認します。
-3. **外出先**: 「外出先 (中継)」を選び、中継サーバーの URL を入力して「接続」。中継の設定（部屋 ID）は初回の接続で自動的に受け取ってあります。
+3. **外出先**: 「外出先 (中継)」を選び、中継サーバーの URL を入力して「接続」。中継の設定（部屋 ID）は初回の接続で自動的に受け取ってあります。WebSocket が使えないネットワーク（会社や公衆 Wi-Fi のプロキシなど）では、自動で普通の HTTP 通信に切り替えてつなぎます。
 4. 接続のたびに Face ID を求められます（Face ID を登録し直したら、もう一度ペアリングが必要です）。
 
 操作（トラックパッド方式）:
@@ -96,13 +97,14 @@ Sources/
   RDCore/
     Security/  Noise XX、暗号化ストリーム、ペアリング、認証、鍵の保管 (DPAPI / キーチェーン)
     Relay / WebSocket / Transport   中継経由の接続 (URLSession / WinHTTP / 最小実装)
+    HTTPRelay / HTTPClient          WebSocket を使わず HTTP リクエストだけで中継する通り道
     ...        メッセージ、ソケット (Winsock / BSD)、タイル差分コーデック
   RDHost/      Windows: GDI キャプチャ + SendInput + 承認ダイアログ（Windows 以外ではテストパターン配信）
   RDViewer/    macOS: AppKit ビューア（--headless で GUI なしの受信テスト）
 ipad/RemoteDesktop.swiftpm/
   App/         iPad アプリ (SwiftUI + UIKit)
   Core/        Sources/RDCore のコピー (scripts/sync-ipad.sh で更新。直接編集しない)
-relay/         中継サーバー (Node.js + ws)
+relay/         中継サーバー (Node.js + ws。WebSocket と HTTP の両方を受け付ける)
 ```
 
 - 画面を 64×64 のタイルに分け、変化したタイルだけを RLE（24bit 色）で送ります。
@@ -134,7 +136,7 @@ cd relay && npm ci && PORT=8099 node server.js
 swift run -c release RDHost --port 6001 --pair --relay ws://127.0.0.1:8099
 ```
 
-（ペアリングは直接接続で行い、その後 `RDViewer --headless --relay ws://127.0.0.1:8099 --frames 90` で中継経由になります）
+（ペアリングは直接接続で行い、その後 `RDViewer --headless --relay ws://127.0.0.1:8099 --frames 90` で中継経由になります。HTTP の通り道を試すときは RDHost と RDViewer の両方に `--relay-transport http` を付けます）
 
 ## 制限
 

@@ -21,9 +21,10 @@
 | `Sources/RDCore/TileCodec.swift` | 画面データのデコード | 境界チェック（悪意あるホスト → ビューアのメモリ破壊がないか） |
 | `Sources/RDCore/Protocol.swift`, `Bytes.swift` | メッセージの解析 | 長さ・範囲の検証 |
 | `Sources/RDCore/WebSocket.swift` | WebSocket クライアント 3 種 | 最小実装（Linux 用）のフレーム解析、WinHTTP の TLS 設定 |
-| `Sources/RDCore/Relay.swift` | 中継経由の待ち受け | 中継サーバーからの制御メッセージを信用していないか |
+| `Sources/RDCore/Relay.swift` | 中継経由の待ち受け、WebSocket と HTTP の切り替え | 中継サーバーからの制御メッセージを信用していないか |
+| `Sources/RDCore/HTTPRelay.swift`, `HTTPClient.swift` | HTTP だけで中継する通り道 | 下りフレームの長さ上限、ストリーム→ポーリング切り替えでの取りこぼし、最小実装（Linux 用）の chunked 解析、WinHTTP のハンドルを使用中に閉じないか |
 | `Sources/RDCore/Socket.swift` | ソケット | `close()` は shutdown のみ・解放は deinit（使用中の番号の再利用を防ぐ） |
-| `relay/server.js` | 中継サーバー | DoS 耐性、部屋の乗っ取り、セッション ID の扱い、`X-Forwarded-For` |
+| `relay/server.js` | 中継サーバー | DoS 耐性、部屋の乗っ取り、セッション ID・leg の扱い、`X-Forwarded-For`、HTTP の通し番号と掃除 |
 | `Sources/RDCore/Security/PostQuantum.swift` | ML-KEM-768 のハイブリッド鍵交換 | 鍵の混ぜ方、交渉のダウングレード耐性 |
 | `Sources/RDCore/Security/DeviceKeyProtection.swift` | iPad の Secure Enclave・Face ID | アクセス制御フラグ、フォールバック時の弱さ |
 | `Sources/RDCore/Security/Storage.swift`（TPMWrap・TrustStore・AuditLog） | TPM での鍵の保護、許可一覧の HMAC、監査ログのハッシュチェーン | 古い形式への差し替え、移行時の扱い |

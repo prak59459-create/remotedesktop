@@ -15,6 +15,9 @@ func usage() -> Never {
                         登録は同じ LAN (Wi-Fi) から直接つないだときだけ受け付ける
       --relay URL       中継サーバー経由でも待ち受ける (例: https://xxxx.onrender.com)
                         ルーターのポート開放は不要。中継サーバーには暗号文しか流れない
+      --relay-transport M  中継サーバーへの通り道: auto (既定) / websocket / http
+                        auto は WebSocket を試し、つながらなければ普通の HTTP リクエストに切り替える
+                        (WebSocket を通さないプロキシや社内ネットワークでは http を指定)
       --no-direct       直接接続 (TCP) の待ち受けをしない (中継のみ)
       --no-bonjour      同じ Wi-Fi の iPad に、この PC の名前を知らせない (IP アドレスで接続する)
       --allow-remote-pairing  LAN 外 (中継経由・インターネット) からの端末登録も許可する (非推奨)
@@ -59,6 +62,12 @@ while let a = args.next() {
             exit(1)
         }
         options.relay = u
+    case "--relay-transport":
+        guard let m = args.next().flatMap(RelayTransportMode.init(rawValue:)) else {
+            print("--relay-transport には auto / websocket / http のどれかを指定してください")
+            exit(1)
+        }
+        RelayTransportMode.default = m
     case "--no-direct": options.direct = false
     case "--no-bonjour": options.bonjour = false
     case "--allow-remote-pairing": options.allowRemotePairing = true
@@ -237,7 +246,7 @@ if let relay = options.relay {
         print("⚠️ 中継サーバーへの経路が TLS ではありません (中身は端末間で暗号化済みですが、https:// を推奨します)")
     }
     let r = RelayHostListener(relay: relay, roomToken: roomToken) { audit.record($0) }
-    print("中継サーバー: \(relay.absoluteString) で待ち受け中 (ポート開放は不要)")
+    print("中継サーバー: \(relay.absoluteString) で待ち受け中 (ポート開放は不要・通り道: \(RelayTransportMode.default.rawValue))")
     Thread { r.run(onIncoming: { serve($0) }) }.start()
 }
 

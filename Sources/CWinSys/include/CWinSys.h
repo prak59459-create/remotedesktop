@@ -1,5 +1,5 @@
 // Swift の WinSDK モジュールに含まれない Windows のヘッダーをここで読み込む。
-//   winhttp.h: 中継サーバーへの WebSocket (TLS)
+//   winhttp.h: 中継サーバーへの WebSocket / HTTP (TLS)
 //   ncrypt.h:  TPM (Microsoft Platform Crypto Provider) による鍵の保護
 //   rd_mdns_*: 同じ LAN の iPad から見つけてもらうための DNS-SD (Bonjour) 公開 (shim.c)
 // Windows 以外では空。

@@ -352,8 +352,8 @@ final class SecurityTests: XCTestCase {
         }
     }
 
-    /// 中継サーバー (relay/server.js) を起動して、中継経由の接続全体を確かめる。Node が無ければ skip。
-    func testRelayEndToEnd() throws {
+    /// 中継サーバー (relay/server.js) を起動する。Node が無ければ skip。終わったら terminate すること
+    private func startRelay() throws -> (Process, URL) {
         let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent()
         let script = repo.appendingPathComponent("relay/server.js")
@@ -379,7 +379,6 @@ final class SecurityTests: XCTestCase {
         proc.environment = penv
         proc.standardOutput = FileHandle.nullDevice
         try proc.run()
-        defer { proc.terminate() }
         // 中継サーバーが待ち受けを始めるまで待つ
         var ready = false
         for _ in 0 ..< 100 where !ready {
@@ -391,13 +390,19 @@ final class SecurityTests: XCTestCase {
             }
         }
         XCTAssertTrue(ready, "中継サーバーが起動しませんでした")
-        let relayURL = URL(string: "ws://127.0.0.1:\(relayPort)")!
+        return (proc, URL(string: "ws://127.0.0.1:\(relayPort)")!)
+    }
+
+    /// 中継サーバーを起動して、中継経由の接続全体を確かめる (WebSocket)。Node が無ければ skip。
+    func testRelayEndToEnd() throws {
+        let (proc, relayURL) = try startRelay()
+        defer { proc.terminate() }
 
         let env = try startHost(streaming: true)
         let gate = env.gate
         let token = [UInt8](repeating: 7, count: 32)
         gate.relayRoom = RelayRoom.id(token: token)
-        let listener = RelayHostListener(relay: relayURL, roomToken: token) { _ in }
+        let listener = RelayHostListener(relay: relayURL, roomToken: token, mode: .webSocket) { _ in }
         defer { listener.stop() }
         Thread { listener.run { Self.serve(gate, $0, streaming: true) } }.start()
         Thread.sleep(forTimeInterval: 0.7)
@@ -414,7 +419,7 @@ final class SecurityTests: XCTestCase {
 
         // 部屋 ID を知っていても、中継経由のペアリングはホストが拒否する (LAN 限定)
         let window = gate.startPairing()
-        let t = try RelayTransport.connect(relay: relayURL, room: gate.relayRoom!)
+        let t = try RelayTransport.connect(relay: relayURL, room: gate.relayRoom!, mode: .webSocket)
         XCTAssertThrowsError(try ViewerConnector.connect(transport: t, label: "relay", identity: viewer, knownHosts: known,
                                                          expectedHostKey: nil, pairingCode: window.code,
                                                          deviceName: "v")) { e in
@@ -443,6 +448,90 @@ final class SecurityTests: XCTestCase {
         // トークンを知らないホストは同じ部屋を取れない (中継サーバーが拒否)
         let impostor = RelayHostListener(relay: relayURL, roomToken: [UInt8](repeating: 8, count: 32)) { _ in }
         XCTAssertNotEqual(impostor.room, gate.relayRoom)
+    }
+
+    /// WebSocket を使わず、普通の HTTP リクエストだけで中継する (ストリーム・ロングポーリング・混在)
+    func testRelayEndToEndOverHTTP() throws {
+        let (proc, relayURL) = try startRelay()
+        defer { proc.terminate() }
+        let env = try startHost(streaming: true)
+        let gate = env.gate
+        let token = [UInt8](repeating: 9, count: 32)
+        gate.relayRoom = RelayRoom.id(token: token)
+        var logs: [String] = []
+        let logLock = NSLock()
+        let listener = RelayHostListener(relay: relayURL, roomToken: token, mode: .http) { line in
+            logLock.lock(); logs.append(line); logLock.unlock()
+        }
+        defer { listener.stop() }
+        Thread { listener.run { Self.serve(gate, $0, streaming: true) } }.start()
+        Thread.sleep(forTimeInterval: 0.7)
+        logLock.lock()
+        XCTAssertTrue(logs.contains { $0.contains("RELAY_UP") && $0.contains("transport=http") }, "\(logs)")
+        logLock.unlock()
+
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        try gate.clients.add(publicKey: viewer.publicKey, name: "v")
+        try known.add(publicKey: env.hostIdentity.publicKey, name: "h")
+        try known.setRelayRoom(publicKey: env.hostIdentity.publicKey, room: gate.relayRoom!)
+
+        func session(_ make: () throws -> Transport, _ label: String) throws {
+            let t = try make()
+            let s = try ViewerConnector.connect(transport: t, label: "relay", identity: viewer, knownHosts: known,
+                                                expectedHostKey: env.hostIdentity.publicKey, pairingCode: nil,
+                                                deviceName: "v")
+            XCTAssertEqual(s.isPostQuantum, PostQuantum.isAvailable, label)
+            for _ in 0 ..< 3 {
+                XCTAssertEqual(try s.channel.receive().type, MessageType.hello.rawValue, label)
+            }
+            s.channel.close()
+        }
+
+        // 下りはストリーム
+        for i in 0 ..< 5 {
+            try session({ try RelayTransport.connect(relay: relayURL, room: gate.relayRoom!, mode: .http) }, "stream \(i)")
+        }
+        // 下りはロングポーリング (ストリームを溜め込むプロキシの経路)。ホスト側も poll になる
+        HTTPRelayTransport.forcePoll = true
+        defer { HTTPRelayTransport.forcePoll = false }
+        for i in 0 ..< 3 {
+            try session({ try HTTPRelayTransport.connect(relay: relayURL, room: gate.relayRoom!) }, "poll \(i)")
+        }
+        HTTPRelayTransport.forcePoll = false
+        // ホストは HTTP、ビューアは WebSocket (中継サーバーが橋渡しする)
+        for i in 0 ..< 3 {
+            try session({ try RelayTransport.connect(relay: relayURL, room: gate.relayRoom!, mode: .webSocket) },
+                        "mixed \(i)")
+        }
+        // ViewerConnector の既定 (auto) でもつながる
+        let s = try ViewerConnector.connect(to: .relay(relayURL), identity: viewer, knownHosts: known,
+                                            expectedHostKey: env.hostIdentity.publicKey, pairingCode: nil,
+                                            deviceName: "v")
+        XCTAssertEqual(try s.channel.receive().type, MessageType.hello.rawValue)
+        s.channel.close()
+
+        // 部屋にホストがいなければ、理由が分かるエラーになる
+        XCTAssertThrowsError(try HTTPRelayTransport.connect(relay: relayURL, room: RelayRoom.id(token: [UInt8](repeating: 1, count: 32)))) { e in
+            guard case RelayError.hostOffline = e else { return XCTFail("\(e)") }
+        }
+    }
+
+    /// 中継サーバーが送ってくる下りのフレームは信用しない
+    func testHTTPRelayFrameParser() throws {
+        var p = HTTPRelayFrameParser()
+        p.feed([0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(try p.next(), .keepalive)
+        XCTAssertNil(try p.next())
+        p.feed([0, 3, 1, 2]) // 前の 2 バイトと合わせて長さ 3。データはまだ 2 バイト
+        XCTAssertNil(try p.next())
+        p.feed([3, 0xFF, 0xFF, 0xFF, 0xFF])
+        XCTAssertEqual(try p.next(), .data([1, 2, 3]))
+        XCTAssertEqual(try p.next(), .closed)
+        var big = HTTPRelayFrameParser()
+        big.feed([0x7F, 0, 0, 0])
+        XCTAssertThrowsError(try big.next())
+        HTTPRelayFrameFuzz.run(Array(0 ..< 255))
     }
 
     func testPairingIsLANOnlyByDefault() {
