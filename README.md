@@ -47,7 +47,7 @@ gh attestation verify RDHost.exe -R prak59459-create/remotedesktop
 RDHost.exe --pair --relay https://<名前>.onrender.com
 ```
 
-表示された**ペアリングコード**と、PC の IP アドレスを iPad に入力します。2 回目以降は `--pair` なしで起動します:
+表示された**ペアリングコード**を iPad に入力します（PC は iPad の「この Wi-Fi で見つかった PC」に名前で出ます。出ないときは画面に表示される IP アドレスを入力）。2 回目以降は `--pair` なしで起動します:
 
 ```bash
 RDHost.exe --relay https://<名前>.onrender.com --confirm
@@ -58,6 +58,7 @@ RDHost.exe --relay https://<名前>.onrender.com --confirm
 | `--pair` | 新しい端末を登録するためのコードを表示（同じ Wi-Fi からのみ。登録時は画面で許可） |
 | `--relay URL` | 中継サーバー経由でも待ち受ける（ポート開放不要） |
 | `--no-direct` | 直接接続（TCP 5999）の待ち受けをしない |
+| `--no-bonjour` | 同じ Wi-Fi の iPad に PC の名前を知らせない（IP アドレスで接続） |
 | `--confirm` | 登録済みの端末でも、接続のたびに Windows 側で許可/拒否のダイアログを出す（外出先で使うなら付けない） |
 | `--on-disconnect blank/lock/none` | 最後の接続が切れたときの画面（既定: モニター消灯） |
 | `--idle-timeout 分` / `--max-session 時間` | 無操作で切断するまでの時間（既定 15 分）/ 最長時間（既定 8 時間） |
@@ -72,7 +73,7 @@ RDHost.exe --relay https://<名前>.onrender.com --confirm
 ### 3. iPad 側
 
 1. このリポジトリの `ipad/RemoteDesktop.swiftpm` フォルダを iPad の「ファイル」に入れ（iCloud Drive など）、**Swift Playgrounds** で開いて実行します。
-2. **初回**: 「同じ Wi-Fi」を選び、PC の IP アドレスとペアリングコードを入力して「接続」。Windows 側に出る確認ダイアログで「はい」を押し、iPad に表示されたホストの指紋が Windows 側の表示と同じか確認します。
+2. **初回**: 「同じ Wi-Fi」を選び、「この Wi-Fi で見つかった PC」から PC を選んで（または IP アドレスを入力して）、ペアリングコードを入力して「接続」。Windows 側に出る確認ダイアログで「はい」を押し、iPad に表示されたホストの指紋が Windows 側の表示と同じか確認します。
 3. **外出先**: 「外出先 (中継)」を選び、中継サーバーの URL を入力して「接続」。中継の設定（部屋 ID）は初回の接続で自動的に受け取ってあります。
 4. 接続のたびに Face ID を求められます（Face ID を登録し直したら、もう一度ペアリングが必要です）。
 

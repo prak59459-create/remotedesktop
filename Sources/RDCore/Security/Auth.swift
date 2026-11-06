@@ -410,6 +410,8 @@ public enum ViewerConnector {
     public enum Endpoint {
         /// LAN 内などで直接 TCP 接続
         case direct(host: String, port: UInt16)
+        /// 同じ LAN で Bonjour により見つけた PC (サービス名) に直接接続 (iPad / Mac のみ)
+        case bonjour(name: String)
         /// 中継サーバー経由
         case relay(URL)
     }
@@ -424,8 +426,20 @@ public enum ViewerConnector {
         let label: String
         switch endpoint {
         case let .direct(host, port):
+            #if os(iOS)
+            // iPad では Network.framework を使う (フィルターや VPN が絡んだときの原因が分かりやすい)
+            transport = try NWTransport.connect(host: host, port: port)
+            #else
             transport = try TCPConnection.open(host: host, port: port)
+            #endif
             label = "\(host):\(port)"
+        case let .bonjour(name):
+            #if canImport(Network)
+            transport = try NWTransport.connect(bonjourName: name)
+            label = name
+            #else
+            throw NetError.connect("\(name) (この環境では Bonjour での接続に対応していません)")
+            #endif
         case let .relay(url):
             // 部屋 ID は、LAN で接続したときにホストから暗号化して受け取ったもの。
             // 中継経由で初めて接続することはできない (端末の登録は LAN 限定)。

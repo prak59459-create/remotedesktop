@@ -30,7 +30,8 @@ let package = Package(
                 .portraitUpsideDown(.when(deviceFamilies: [.pad])),
             ],
             capabilities: [
-                .localNetwork(purposeString: "同じ Wi-Fi にある Windows PC に接続するために使います。"),
+                .localNetwork(purposeString: "同じ Wi-Fi にある Windows PC を探して接続するために使います。",
+                              bonjourServiceTypes: ["_rdhost._tcp"]),
                 .faceID(purposeString: "PC に接続する前に、本人であることを確認します。"),
             ]
         ),

@@ -111,6 +111,53 @@ public enum Net {
 
     /// ソケットを使う前に一度呼ぶ (Windows では WSAStartup)。
     public static func initialize() { _ = once }
+
+    /// 外へ出るときに使われる自分の IPv4 アドレス (家の LAN の IP)。UDP の宛先を決めるだけでパケットは送らない。
+    public static func primaryLocalIPv4() -> String? {
+        initialize()
+        var hints = addrinfo()
+        hints.ai_family = kAF_INET
+        hints.ai_socktype = 2 // SOCK_DGRAM
+        hints.ai_flags = 4 // AI_NUMERICHOST
+        var result: UnsafeMutablePointer<addrinfo>? = nil
+        guard getaddrinfo("8.8.8.8", "53", &hints, &result) == 0, let ai = result else { return nil }
+        defer { freeaddrinfo(ai) }
+        let s = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
+        guard s != invalidSocket else { return nil }
+        defer { rawClose(s) }
+        guard connect(s, ai.pointee.ai_addr, numericCast(ai.pointee.ai_addrlen)) == 0 else { return nil }
+        var addr = sockaddr_in()
+        #if os(Windows)
+        var len = Int32(MemoryLayout<sockaddr_in>.size)
+        #else
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        #endif
+        let ok = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(s, $0, &len) }
+        }
+        guard ok == 0 else { return nil }
+        let ip = describeIP(addr)
+        return ip == "0.0.0.0" ? nil : ip
+    }
+
+    /// 接続エラーの番号から、利用者向けの原因と対処を返す (該当なしなら空)
+    public static func connectHint(_ code: Int32) -> String {
+        #if os(Windows)
+        let refused: [Int32] = [10061], unreachable: [Int32] = [10065, 10051], timedOut: [Int32] = [10060]
+        #else
+        let refused = [ECONNREFUSED], unreachable = [EHOSTUNREACH, ENETUNREACH], timedOut = [ETIMEDOUT]
+        #endif
+        if refused.contains(code) {
+            return "。PC には届きましたが、RDHost がそのポートで待ち受けていません (RDHost が起動しているか、ポート番号が合っているか確認してください)"
+        }
+        if unreachable.contains(code) {
+            return "。PC まで届いていません。i-フィルターなどのフィルターアプリや VPN が通信を止めていないか、ローカルネットワークの許可、IP アドレスを確認してください"
+        }
+        if timedOut.contains(code) {
+            return "。応答がありません。PC の電源、同じ Wi-Fi か、Windows ファイアウォールを確認してください"
+        }
+        return ""
+    }
 }
 
 // MARK: - TCP 接続
@@ -179,7 +226,7 @@ public final class TCPConnection: ByteStream {
             }
             cursor = ai.pointee.ai_next
         }
-        throw NetError.connect("\(host):\(port) (error \(lastErr))")
+        throw NetError.connect("\(host):\(port) (error \(lastErr))\(Net.connectHint(lastErr))")
     }
 
     public func sendAll(_ bytes: [UInt8]) throws {

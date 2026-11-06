@@ -1,5 +1,8 @@
 import Foundation
 
+/// Bonjour (DNS-SD) で公開する RDHost のサービス種別。iPad アプリの Info.plist (NSBonjourServices) と同じにする
+public let rdBonjourServiceTypeName = "_rdhost._tcp"
+
 /// 暗号化チャネル (SecureStream) の下に敷く通信路。TCP 直結と中継サーバー経由を同じように扱う。
 /// ここを流れるのは Noise の暗号文だけなので、通信路そのものは信用しない前提。
 public protocol Transport: ByteStream {

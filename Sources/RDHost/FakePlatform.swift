@@ -81,6 +81,30 @@ func showConnectionIndicator(_ text: String?) {
 }
 
 func makeCapturer(scale: Int) -> ScreenCapturer? { TestPatternCapturer(scale: scale) }
+
+func computerName() -> String {
+    let n = ProcessInfo.processInfo.hostName
+    return n.hasSuffix(".local") ? String(n.dropLast(6)) : n
+}
+
+#if os(macOS)
+private var bonjourService: NetService?
+
+/// Mac では NetService で公開する (iPad シミュレーターでの動作確認用)
+func advertiseBonjour(name: String, port: UInt16, ip: String?) -> String? {
+    Thread {
+        let s = NetService(domain: "local.", type: "\(rdBonjourServiceTypeName).", name: name, port: Int32(port))
+        bonjourService = s
+        s.publish()
+        RunLoop.current.run()
+    }.start()
+    return nil
+}
+#else
+func advertiseBonjour(name: String, port: UInt16, ip: String?) -> String? {
+    "この OS では未対応"
+}
+#endif
 func makeInjector() -> InputInjector { LoggingInputInjector() }
 func platformSetup() {
     print("※ Windows 以外なのでテストパターンを配信します (入力はログ出力のみ)")

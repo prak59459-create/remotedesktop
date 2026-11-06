@@ -21,6 +21,7 @@ final class ViewerClient {
     var label: String {
         switch endpoint {
         case let .direct(host, port): return "\(host):\(port)"
+        case let .bonjour(name): return name
         case let .relay(url): return "中継 \(url.host ?? "")"
         }
     }
