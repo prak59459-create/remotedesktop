@@ -2,6 +2,7 @@
 import Dispatch
 import CWinSys
 import Foundation
+import RDCore
 import WinSDK
 
 // マクロのキャスト付き定数は Swift に取り込まれないことがあるので自前で定義する
