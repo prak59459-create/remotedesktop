@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           $out = "$env:RUNNER_TEMP\gui"
-          $p = Start-Process -FilePath "dist\RDHost\RemoteDesktopHost.exe" -ArgumentList "--screenshot", $out -PassThru
+          $p = Start-Process -FilePath "dist\RDHost\RemoteDesktopHost.exe" -ArgumentList "--screenshot", $out, "--allow-admin" -PassThru
           if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI が終わりません" }
           New-Item -ItemType Directory -Force screenshots-windows | Out-Null
           Add-Type -AssemblyName System.Drawing

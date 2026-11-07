@@ -960,7 +960,8 @@ func runApp() {
     func fail(_ title: String, _ text: String) {
         _ = withWide(text) { t in withWide(title) { c in MessageBoxW(nil, t, c, 0x10 /* MB_ICONERROR */) } }
     }
-    if let problem = HostService.environmentProblem(allowAdmin: args.contains("--allow-admin")) {
+    // 画面確認モードは CI (SYSTEM 権限) で動かすので、確認のダイアログは出さない (出すと誰も閉じられず止まる)
+    if screenshotDir == nil, let problem = HostService.environmentProblem(allowAdmin: args.contains("--allow-admin")) {
         fail("Remote Desktop ホスト", problem)
         return
     }
