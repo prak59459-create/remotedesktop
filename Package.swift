@@ -18,7 +18,7 @@ let package = Package(
     dependencies: [
         // 暗号プリミティブ (X25519 / ChaCha20-Poly1305 / SHA-256 / HMAC)。
         // Apple 製。macOS では CryptoKit、Windows / Linux では BoringSSL を使う。
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "5.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "6.0.0"),
     ],
     targets: [
         .target(
