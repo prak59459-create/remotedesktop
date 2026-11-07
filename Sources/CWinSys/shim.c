@@ -22,7 +22,8 @@ static VOID WINAPI rd_mdns_done(DWORD status, PVOID context, PDNS_SERVICE_INSTAN
 
 unsigned long rd_mdns_register(const wchar_t *instanceName, const wchar_t *hostName,
                                unsigned long ip4, unsigned short port) {
-    HMODULE dll = LoadLibraryW(L"dnsapi.dll");
+    // System32 からだけ読み込む (カレントフォルダやダウンロードフォルダの同名 DLL を読まないように)
+    HMODULE dll = LoadLibraryExW(L"dnsapi.dll", NULL, 0x00000800 /* LOAD_LIBRARY_SEARCH_SYSTEM32 */);
     if (!dll) return GetLastError();
     ConstructInstanceFn construct = (ConstructInstanceFn)(void *)GetProcAddress(dll, "DnsServiceConstructInstance");
     ServiceRegisterFn reg = (ServiceRegisterFn)(void *)GetProcAddress(dll, "DnsServiceRegister");

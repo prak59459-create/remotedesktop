@@ -109,7 +109,7 @@ struct NoiseCipherState {
 
 // MARK: - SymmetricState
 
-func noiseHMAC(key: [UInt8], _ data: [UInt8]) -> [UInt8] {
+public func noiseHMAC(key: [UInt8], _ data: [UInt8]) -> [UInt8] {
     Array(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key)))
 }
 
@@ -289,6 +289,9 @@ public final class NoiseXXHandshake {
 
     /// ハンドシェイクハッシュ (チャネルバインディングに使う)
     public var handshakeHash: [UInt8] { ss.h }
+
+    /// 完了時のチェイニングキー (X25519 の共有秘密から作られた秘密の値)。耐量子鍵交換で鍵に混ぜる
+    var chainingKey: [UInt8] { ss.ck }
 
     /// 完了後に送信用・受信用の CipherState を取り出す
     func split() throws -> (send: NoiseCipherState, receive: NoiseCipherState) {

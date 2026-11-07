@@ -47,30 +47,40 @@ public final class SecureStream: ByteStream {
     static let maxPlaintextPerRecord = noiseMaxMessage - noiseTagLen
     private static let negotiationVersion: UInt8 = 3
     private static let flagPQ: UInt8 = 0x01
+    /// 耐量子の鍵に、X25519 由来の秘密 (Noise のチェイニングキー) も混ぜる (v2)。
+    /// 両方が対応しているときだけ使う (古い版とは v1 のまま)
+    private static let flagMixCK: UInt8 = 0x02
     private static let flagRejected: UInt8 = 0x80
+    /// ハンドシェイク完了時のチェイニングキー (秘密)
+    private let handshakeCK: [UInt8]
 
     private init(transport: Transport, handshake: NoiseXXHandshake) throws {
         guard let rs = handshake.remoteStaticKey else { throw NoiseError.invalidState }
         self.transport = transport
         remoteStaticKey = rs
         handshakeHash = handshake.handshakeHash
+        handshakeCK = handshake.chainingKey
         let (s, r) = try handshake.split()
         sendCipher = s
         recvCipher = r
     }
 
     /// ビューア側 (イニシエータ)
+    /// verifyRemote: ホストの公開鍵 (2 通目で届く) を確かめる。こちらの公開鍵を送る (3 通目) より前に呼ぶので、
+    /// なりすましのホストにはこちらの端末の鍵を見せずに中止できる
     public static func connect(_ tcp: Transport, identity: StaticIdentity,
-                               offerPostQuantum: Bool = PostQuantum.isAvailable) throws -> SecureStream {
+                               offerPostQuantum: Bool = PostQuantum.isAvailable,
+                               verifyRemote: (([UInt8]) throws -> Void)? = nil) throws -> SecureStream {
         let hs = NoiseXXHandshake(role: .initiator, staticKey: identity.privateKey, prologue: rdPrologue)
         try writeFrame(tcp, try hs.writeMessage())
         _ = try hs.readMessage(try readFrame(tcp))
+        if let verify = verifyRemote, let rs = hs.remoteStaticKey { try verify(rs) }
         try writeFrame(tcp, try hs.writeMessage())
         let s = try SecureStream(transport: tcp, handshake: hs)
 
         // 耐量子鍵交換の交渉 (ここから先は暗号化済み)
         let pq = offerPostQuantum ? try PostQuantum.Initiator() : nil
-        var offer: [UInt8] = [negotiationVersion, pq == nil ? 0 : flagPQ]
+        var offer: [UInt8] = [negotiationVersion, pq == nil ? 0 : flagPQ | flagMixCK]
         if let pq = pq { offer += pq.publicKey }
         try s.sendRecord(offer)
         let reply = try s.receiveRecord()
@@ -81,7 +91,8 @@ public final class SecureStream: ByteStream {
                 throw NoiseError.malformed("ML-KEM の応答")
             }
             let ct = Array(reply[2...])
-            try s.mixPostQuantum(secret: try pq.decapsulate(ct), publicKey: pq.publicKey, ciphertext: ct, initiator: true)
+            try s.mixPostQuantum(secret: try pq.decapsulate(ct), publicKey: pq.publicKey, ciphertext: ct, initiator: true,
+                                 mixCK: reply[1] & flagMixCK != 0)
         }
         s.enableRekey()
         return s
@@ -103,8 +114,9 @@ public final class SecureStream: ByteStream {
             guard offer.count == 2 + PostQuantum.publicKeySize else { throw NoiseError.malformed("ML-KEM 公開鍵") }
             let ek = Array(offer[2...])
             let (ct, secret) = try PostQuantum.encapsulate(to: ek)
-            try s.sendRecord([negotiationVersion, flagPQ] + ct)
-            try s.mixPostQuantum(secret: secret, publicKey: ek, ciphertext: ct, initiator: false)
+            let mixCK = offer[1] & flagMixCK != 0
+            try s.sendRecord([negotiationVersion, flagPQ | (mixCK ? flagMixCK : 0)] + ct)
+            try s.mixPostQuantum(secret: secret, publicKey: ek, ciphertext: ct, initiator: false, mixCK: mixCK)
         } else if requirePostQuantum {
             try? s.sendRecord([negotiationVersion, flagRejected])
             s.close()
@@ -116,10 +128,14 @@ public final class SecureStream: ByteStream {
         return s
     }
 
-    /// X25519 由来の鍵と ML-KEM の共有秘密から、新しい送受信鍵を作る
-    private func mixPostQuantum(secret: [UInt8], publicKey: [UInt8], ciphertext: [UInt8], initiator: Bool) throws {
+    /// X25519 由来の鍵と ML-KEM の共有秘密から、新しい送受信鍵を作る。
+    /// mixCK (v2): Noise のチェイニングキー (X25519 の共有秘密から作られた秘密) も混ぜる。
+    /// v1 はハンドシェイクハッシュ (秘密ではない) だけだったので、鍵の強さが ML-KEM だけに頼っていた
+    private func mixPostQuantum(secret: [UInt8], publicKey: [UInt8], ciphertext: [UInt8], initiator: Bool,
+                                mixCK: Bool) throws {
         var h = SHA256()
-        h.update(data: Array("RemoteDesktop PQ hybrid v1".utf8))
+        h.update(data: Array((mixCK ? "RemoteDesktop PQ hybrid v2" : "RemoteDesktop PQ hybrid v1").utf8))
+        if mixCK { h.update(data: handshakeCK) }
         h.update(data: handshakeHash)
         h.update(data: publicKey)
         h.update(data: ciphertext)

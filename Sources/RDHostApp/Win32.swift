@@ -219,7 +219,8 @@ func enableVisualStyles() {
         _ = ActivateActCtx(h, &cookie)
     }
     // この状態で読み込むと、バージョン 6 のコモンコントロールが使われる
-    if let lib = withWide("comctl32.dll", { LoadLibraryW($0) }),
+    // System32 (と、上で有効にしたアクティベーションコンテキストの WinSxS) からだけ読み込む
+    if let lib = withWide("comctl32.dll", { LoadLibraryExW($0, nil, 0x0000_0800 /* LOAD_LIBRARY_SEARCH_SYSTEM32 */) }),
        let proc = GetProcAddress(lib, "InitCommonControls") {
         typealias Fn = @convention(c) () -> Void
         unsafeBitCast(proc, to: Fn.self)()
