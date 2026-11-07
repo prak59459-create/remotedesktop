@@ -105,7 +105,7 @@ if __name__ == "__main__":
     save(draw_icon(rounded=True), os.path.join(ROOT, "docs", "images", "icon.png"), 256)
     # Windows の .ico (複数サイズ入り)
     ico = draw_icon(rounded=True)
-    path = os.path.join(ROOT, "Sources", "RDHostApp", "Resources", "AppIcon.ico")
+    path = os.path.join(ROOT, "Sources", "RDHostApp", "AppIcon.ico")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ico.resize((256, 256), Image.LANCZOS).save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     print("wrote", os.path.relpath(path, ROOT))

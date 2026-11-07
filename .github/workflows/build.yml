@@ -37,6 +37,27 @@ jobs:
         run: ./scripts/build-windows.ps1
       - name: Test (includes relay end-to-end over WinHTTP)
         run: swift test
+      - name: GUI screenshots (RemoteDesktopHost.exe)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\gui"
+          $p = Start-Process -FilePath "dist\RDHost\RemoteDesktopHost.exe" -ArgumentList "--screenshot", $out -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI が終わりません" }
+          New-Item -ItemType Directory -Force screenshots-windows | Out-Null
+          Add-Type -AssemblyName System.Drawing
+          Get-ChildItem "$out\*.bmp" | ForEach-Object {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $img.Save("screenshots-windows\$($_.BaseName).png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $img.Dispose()
+          }
+          Get-ChildItem screenshots-windows
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: screenshots-windows
+          path: screenshots-windows
+          if-no-files-found: ignore
       - name: Attest build provenance
         # 同じリポジトリからの実行だけ (フォークの PR には署名権限を与えない)
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -44,6 +65,7 @@ jobs:
         with:
           subject-path: |
             dist/RDHost/RDHost.exe
+            dist/RDHost/RemoteDesktopHost.exe
             dist/RDHost-windows-x64.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

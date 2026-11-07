@@ -1,5 +1,6 @@
 import Foundation
 import RDCore
+import RDHostKit
 
 // RDHost: 画面を配信し、ビューアからの入力を受け付ける (Windows 用)
 //
@@ -108,42 +109,33 @@ if command == .verifyLog {
     }
 }
 
-let identity: StaticIdentity
-let clients: TrustStore
-let roomToken: [UInt8]
+let service: HostService
 do {
-    identity = try SecretStore.loadOrCreateIdentity(name: "host_identity")
-    // 許可端末の一覧は、ホストの秘密鍵 (TPM + DPAPI で保護) から導出した鍵で署名する。
-    // ファイルだけ書き換えても、署名の鍵だけ消しても端末を追加できない。
-    clients = try TrustStore(fileName: "authorized_devices.json", integrityKey: TrustStore.integrityKey(for: identity))
-    roomToken = try SecretStore.loadOrCreateSecret(name: "relay_room_token").bytes
+    service = try HostService(options: options)
 } catch {
     print("エラー: 鍵を読み込めません: \(error)")
     exit(1)
 }
-if clients.isTampered && command != .resetDevices {
+if service.isTampered && command != .resetDevices {
     print("⚠️ 許可端末の一覧が改ざんされています。すべての接続を拒否します。")
     print("   心当たりがなければ PC の安全を確認したうえで RDHost --reset-devices を実行し、端末をペアリングし直してください。")
-    AuditLog().record("TRUST_STORE_TAMPERED")
 }
 
 switch command {
 case .fingerprint:
-    print(identity.fingerprint)
+    print(service.fingerprint)
     exit(0)
 case .list:
-    let all = clients.all
+    let all = service.devices
     if all.isEmpty { print("登録済みの端末はありません") }
-    for e in all {
-        let fp = Fingerprint.fromHex(e.publicKey).map(Fingerprint.display) ?? "?"
-        print("\(fp)  \(e.name)  登録: \(e.added)  最終接続: \(e.lastSeen.map { "\($0)" } ?? "-")")
+    for d in all {
+        print("\(d.fingerprint)  \(d.name)  登録: \(d.added)  最終接続: \(d.lastSeen.map { "\($0)" } ?? "-")")
     }
     exit(0)
 case .revoke(let q):
     do {
-        let n = try clients.remove(matching: q)
+        let n = try service.revoke(q)
         print(n > 0 ? "\(n) 件の端末を取り消しました" : "一致する端末がありません (4 文字以上指定してください)")
-        if n > 0 { AuditLog().record("DEVICE_REVOKED query=\(q) count=\(n)") }
         exit(n > 0 ? 0 : 1)
     } catch {
         print("エラー: \(error)")
@@ -151,8 +143,7 @@ case .revoke(let q):
     }
 case .resetDevices:
     do {
-        try clients.reset()
-        AuditLog().record("DEVICES_RESET")
+        try service.resetDevices()
         print("登録済み端末をすべて消しました。RDHost --pair で端末をペアリングし直してください。")
         exit(0)
     } catch {
@@ -165,121 +156,42 @@ case .serve:
     break
 }
 
-if isRunningElevated() && !options.allowAdmin {
-    print("⚠️ 管理者権限で起動されています。乗っ取られたときの被害を小さくするため、通常のユーザーで起動してください。")
+if let problem = HostService.environmentProblem(allowAdmin: options.allowAdmin) {
+    print("⚠️ \(problem)")
     print("   (どうしても必要な場合は --allow-admin)")
     exit(1)
 }
 
-platformSetup()
+HostService.setupPlatform()
 #if !os(Windows)
 // 同じ PC 内での自動テスト用 (Windows 版には無い)
 if ProcessInfo.processInfo.environment["RD_TEST_LOOPBACK_IS_LAN"] == "1" { TCPConnection.treatLoopbackAsLAN = true }
 #endif
-let audit = AuditLog()
-audit.mirror = { line, important in writeEventLog(line, warning: important) }
-ActiveSessions.shared.onDisconnect = options.onDisconnect
-let gate = HostGatekeeper(identity: identity, clients: clients, audit: audit)
-gate.allowRemotePairing = options.allowRemotePairing
-gate.requirePostQuantum = options.requirePostQuantum
-gate.relayRoom = options.relay != nil ? RelayRoom.id(token: roomToken) : nil
-/// 確認ダイアログは同時に 1 つだけ。開いている間に来た要求は待たせずに拒否する
-/// (答えのないダイアログの後ろに接続が溜まって、ホストが受け付けられなくなるのを防ぐ)
-final class ConsentGate {
-    private let lock = NSLock()
-    private var open = false
-    func ask(_ name: String, _ fp: String, _ peer: String, _ isNew: Bool) -> Bool {
-        lock.lock()
-        if open {
-            lock.unlock()
-            return false
-        }
-        open = true
-        lock.unlock()
-        defer { lock.lock(); open = false; lock.unlock() }
-        return askConsent(name: name, fingerprint: fp, peer: peer, isNew: isNew)
-    }
-}
-let consentGate = ConsentGate()
-let ask: HostGatekeeper.ConsentHandler = { consentGate.ask($0, $1, $2, $3) }
-gate.newDeviceConsent = ask // 新しい端末の登録は必ず画面で確認
-if options.confirm { gate.consent = ask }
 
-guard options.direct || options.relay != nil else {
-    print("エラー: --no-direct を使うときは --relay も指定してください")
+do {
+    try service.start()
+} catch {
+    print("エラー: \(error)")
     exit(1)
 }
 
-func serve(_ transport: Transport) {
-    Thread {
-        do {
-            let client = try gate.authenticate(transport)
-            HostSession(client: client, gate: gate, options: options, audit: audit).run()
-        } catch {
-            // 理由は監査ログに記録済み
-        }
-    }.start()
-}
-
-var listener: TCPListener?
-if options.direct {
-    do {
-        listener = try TCPListener(port: options.port, bindAddress: options.bindAddress)
-    } catch {
-        print("エラー: \(error)")
-        exit(1)
-    }
-    print("直接接続: \(options.bindAddress ?? "0.0.0.0"):\(options.port) で待ち受け中")
-    let lanIP = options.bindAddress ?? Net.primaryLocalIPv4()
-    let pcName = computerName()
-    if options.bonjour, let l = listener {
-        if let err = advertiseBonjour(name: pcName, port: l.boundPort, ip: lanIP) {
-            print("※ Bonjour での公開に失敗しました (\(err))。iPad では IP アドレスで接続してください")
-        } else {
-            print("同じ Wi-Fi の iPad の接続画面に「\(pcName)」が表示されます")
-        }
-    }
-    if let ip = lanIP {
-        print("IP アドレスで接続する場合: \(ip)  ポート \(listener?.boundPort ?? options.port)")
-    }
-}
-if let relay = options.relay {
-    if relay.scheme == "http" || relay.scheme == "ws" {
-        print("⚠️ 中継サーバーへの経路が TLS ではありません (中身は端末間で暗号化済みですが、https:// を推奨します)")
-    }
-    let r = RelayHostListener(relay: relay, roomToken: roomToken) { audit.record($0) }
-    print("中継サーバー: \(relay.absoluteString) で待ち受け中 (ポート開放は不要・通り道: \(RelayTransportMode.default.rawValue))")
-    Thread { r.run(onIncoming: { serve($0) }) }.start()
-}
-
-print("ホストの指紋: \(identity.fingerprint)")
-print("登録済み端末: \(clients.all.count) 台\(options.confirm ? " / 接続時に確認あり" : "")")
+print("ホストの指紋: \(service.fingerprint)")
+print("登録済み端末: \(service.devices.count) 台\(options.confirm ? " / 接続時に確認あり" : "")")
 print("無操作 \(Int(options.idleTimeout / 60)) 分で切断 / 切断時: \(options.onDisconnect.rawValue)\(options.requirePostQuantum ? " / 耐量子暗号必須" : "")")
 if options.pair {
-    let w = gate.startPairing()
+    let w = service.startPairing()
     print("""
 
     ┌──────────────────────────────────────────────┐
-      ペアリングコード:  \(w.code.string)
+      ペアリングコード:  \(w.code)
       (10 分間・1 回限り有効。他人に見せないでください)
       \(options.allowRemotePairing ? "※ LAN 外からの登録も許可しています" : "iPad / Mac を同じ Wi-Fi につないで、この PC の IP アドレスに直接接続してください")
     └──────────────────────────────────────────────┘
 
     """)
-} else if clients.all.isEmpty {
+} else if service.devices.isEmpty {
     print("※ 端末が未登録です。RDHost --pair で起動し、同じ Wi-Fi からペアリングしてください。")
 }
-audit.record("HOST_START direct=\(options.direct) relay=\(options.relay?.host ?? "-") pairing=\(options.pair) confirm=\(options.confirm) remote_pairing=\(options.allowRemotePairing) require_pq=\(options.requirePostQuantum)")
 
-if let l = listener {
-    while true {
-        do {
-            serve(try l.accept())
-        } catch {
-            print("accept エラー: \(error)")
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-    }
-} else {
-    while true { Thread.sleep(forTimeInterval: 3600) }
-}
+// 待ち受けは別スレッド。このスレッドは終了しないように待つ
+while true { Thread.sleep(forTimeInterval: 3600) }

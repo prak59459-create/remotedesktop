@@ -2,30 +2,45 @@ import Dispatch
 import Foundation
 import RDCore
 
-struct HostOptions {
-    var port: UInt16 = defaultPort
-    var bindAddress: String?
-    var fps: Double = 30
-    var scale: Int = 1
-    var pair = false
-    var confirm = false
-    var relay: URL?
-    var direct = true
+public struct HostOptions {
+    public var port: UInt16 = defaultPort
+    public var bindAddress: String?
+    public var fps: Double = 30
+    public var scale: Int = 1
+    public var pair = false
+    public var confirm = false
+    public var relay: URL?
+    public var direct = true
     /// 同じ LAN の iPad から見つけられるよう、Bonjour (DNS-SD) で PC の名前とポートを知らせる
-    var bonjour = true
-    var allowRemotePairing = false
+    public var bonjour = true
+    public var allowRemotePairing = false
     /// 入力が無いまま、この秒数が過ぎたら切断する
-    var idleTimeout: TimeInterval = 15 * 60
+    public var idleTimeout: TimeInterval = 15 * 60
     /// 1 回のセッションの最長時間 (秒)
-    var maxSession: TimeInterval = 8 * 3600
-    var onDisconnect = DisconnectAction.blank
-    var requirePostQuantum = false
-    var allowAdmin = false
+    public var maxSession: TimeInterval = 8 * 3600
+    public var onDisconnect = DisconnectAction.blank
+    public var requirePostQuantum = false
+    public var allowAdmin = false
     /// 画面データの送信量の上限 (kbps)。0 で無制限。無料の中継サーバーの月間転送量を守るため
-    var maxKbps: Double = 0
+    public var maxKbps: Double = 0
     /// 通信量をこの秒数ごとに表示する。0 で表示しない
-    var statsInterval: TimeInterval = 60
+    public var statsInterval: TimeInterval = 60
+
+    public init() {}
 }
+
+/// ホストの表示用メッセージの出口。コマンドライン版は標準出力、GUI 版はウィンドウのログ欄へ
+public enum HostLog {
+    private static let lock = NSLock()
+    private static var _sink: (String) -> Void = { print($0) }
+
+    public static var sink: (String) -> Void {
+        get { lock.lock(); defer { lock.unlock() }; return _sink }
+        set { lock.lock(); _sink = newValue; lock.unlock() }
+    }
+}
+
+func hostLog(_ line: String) { HostLog.sink(line) }
 
 /// 接続中のセッション。画面上部の「接続中」表示と、最後の切断時の画面保護を受け持つ。
 final class ActiveSessions {
@@ -34,6 +49,14 @@ final class ActiveSessions {
     private var names: [Int: String] = [:]
     private var nextID = 0
     var onDisconnect = DisconnectAction.blank
+    /// 接続が増えた・減ったとき (GUI の表示更新用)
+    var onChange: (() -> Void)?
+
+    /// 接続中の端末の名前
+    var current: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return names.values.sorted()
+    }
 
     func begin(_ name: String) -> Int {
         lock.lock()
@@ -43,6 +66,7 @@ final class ActiveSessions {
         let text = label()
         lock.unlock()
         showConnectionIndicator(text)
+        onChange?()
         return id
     }
 
@@ -58,6 +82,7 @@ final class ActiveSessions {
         } else {
             showConnectionIndicator(text)
         }
+        onChange?()
     }
 
     private func label() -> String {
@@ -126,7 +151,7 @@ final class HostSession {
         let reason = sendLoop()
         markClosed()
         audit.record("SESSION_END name=\(client.name) peer=\(client.peer) reason=\(reason) sent_kb=\(totalSent / 1024)")
-        print("通信量: このセッションで計 \(formatBytes(totalSent)) を送信しました")
+        hostLog("通信量: このセッションで計 \(formatBytes(totalSent)) を送信しました")
         ActiveSessions.shared.end(token)
     }
 
@@ -151,7 +176,7 @@ final class HostSession {
         var lastAuthCheck = Date()
         while !isClosed {
             guard let capturer = makeCapturer(scale: options.scale) else {
-                print("画面キャプチャを初期化できません。1 秒後に再試行します")
+                hostLog("画面キャプチャを初期化できません。1 秒後に再試行します")
                 Thread.sleep(forTimeInterval: 1)
                 if let r = expired(now: Date()) { return r }
                 continue
@@ -159,7 +184,7 @@ final class HostSession {
             stateLock.lock()
             mapping = (capturer.width, capturer.height, capturer.screenWidth, capturer.screenHeight)
             stateLock.unlock()
-            print("画面 \(capturer.screenWidth)x\(capturer.screenHeight) → 送信 \(capturer.width)x\(capturer.height)")
+            hostLog("画面 \(capturer.screenWidth)x\(capturer.screenHeight) → 送信 \(capturer.width)x\(capturer.height)")
 
             do {
                 try channel.send(.hello, Hello(width: capturer.width, height: capturer.height).encode())
@@ -206,7 +231,7 @@ final class HostSession {
                     let bytes = s.bytes - statsBase.bytes
                     if bytes > 0 {
                         let secs = Date().timeIntervalSince(lastStats)
-                        print(String(format: "通信量: 直近 %.0f 秒で %@ (平均 %.0f kbps) / 送信 %d 回・タイル 可逆 %d 粗い %d 高画質化 %d",
+                        hostLog(String(format: "通信量: 直近 %.0f 秒で %@ (平均 %.0f kbps) / 送信 %d 回・タイル 可逆 %d 粗い %d 高画質化 %d",
                                      secs, formatBytes(bytes), Double(bytes) * 8 / secs / 1000,
                                      s.frames - statsBase.frames, s.losslessTiles - statsBase.losslessTiles,
                                      s.lossyTiles - statsBase.lossyTiles, s.refinedTiles - statsBase.refinedTiles))

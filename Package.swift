@@ -8,8 +8,10 @@ let package = Package(
     ],
     products: [
         .library(name: "RDCore", targets: ["RDCore"]),
-        // Windows で動かす「接続される側」(画面キャプチャ + 入力注入)
+        // Windows で動かす「接続される側」(画面キャプチャ + 入力注入)。コマンドライン版
         .executable(name: "RDHost", targets: ["RDHost"]),
+        // 同じく GUI 版 (ウィンドウとタスクトレイ)
+        .executable(name: "RemoteDesktopHost", targets: ["RemoteDesktopHost"]),
         // macOS で動かす「接続する側」(ビューア)
         .executable(name: "RDViewer", targets: ["RDViewer"]),
     ],
@@ -41,13 +43,40 @@ let package = Package(
                 .linkedFramework("LocalAuthentication", .when(platforms: [.macOS])),
             ]
         ),
-        .executableTarget(
-            name: "RDHost",
-            dependencies: ["RDCore"],
+        // ホスト (接続される側) の本体。コマンドライン版と GUI 版で共有する
+        .target(
+            name: "RDHostKit",
+            dependencies: [
+                "RDCore",
+                .target(name: "CWinSys", condition: .when(platforms: [.windows])),
+            ],
             linkerSettings: [
                 .linkedLibrary("User32", .when(platforms: [.windows])),
                 .linkedLibrary("Gdi32", .when(platforms: [.windows])),
                 .linkedLibrary("Ws2_32", .when(platforms: [.windows])),
+                .linkedLibrary("Advapi32", .when(platforms: [.windows])),
+            ]
+        ),
+        // コマンドライン版 (RDHost.exe)
+        .executableTarget(
+            name: "RDHost",
+            dependencies: ["RDHostKit", "RDCore"]
+        ),
+        // GUI 版 (RemoteDesktopHost.exe)。Windows 以外では「Windows 専用」と表示するだけ
+        .executableTarget(
+            name: "RemoteDesktopHost",
+            dependencies: ["RDHostKit", "RDCore"],
+            path: "Sources/RDHostApp",
+            exclude: ["AppIcon.ico"],
+            linkerSettings: [
+                .linkedLibrary("User32", .when(platforms: [.windows])),
+                .linkedLibrary("Gdi32", .when(platforms: [.windows])),
+                .linkedLibrary("Shell32", .when(platforms: [.windows])),
+                .linkedLibrary("Advapi32", .when(platforms: [.windows])),
+                .linkedLibrary("Kernel32", .when(platforms: [.windows])),
+                // コンソール窓を出さない GUI アプリとしてリンクする (入口は通常の main)
+                .unsafeFlags(["-Xlinker", "/SUBSYSTEM:WINDOWS", "-Xlinker", "/ENTRY:mainCRTStartup"],
+                             .when(platforms: [.windows])),
             ]
         ),
         .executableTarget(
