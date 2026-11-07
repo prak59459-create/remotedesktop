@@ -16,9 +16,10 @@ let package = Package(
             name: "RemoteDesktop",
             targets: ["AppModule"],
             bundleIdentifier: "local.remotedesktop.viewer",
-            displayVersion: "1.0",
-            bundleVersion: "1",
-            accentColor: .presetColor(.blue),
+            displayVersion: "2.0",
+            bundleVersion: "2",
+            appIcon: .asset("AppIcon"),
+            accentColor: .presetColor(.indigo),
             supportedDeviceFamilies: [
                 .pad,
                 .phone,
