@@ -47,6 +47,7 @@ final class ActiveSessions {
     static let shared = ActiveSessions()
     private let lock = NSLock()
     private var names: [Int: String] = [:]
+    private var killers: [Int: (String) -> Void] = [:]
     private var nextID = 0
     var onDisconnect = DisconnectAction.blank
     /// 接続が増えた・減ったとき (GUI の表示更新用)
@@ -58,11 +59,13 @@ final class ActiveSessions {
         return names.values.sorted()
     }
 
-    func begin(_ name: String) -> Int {
+    /// kill: ホスト側から切断するときに呼ぶ (理由を渡す)
+    func begin(_ name: String, kill: ((String) -> Void)? = nil) -> Int {
         lock.lock()
         nextID += 1
         let id = nextID
         names[id] = name
+        killers[id] = kill
         let text = label()
         lock.unlock()
         showConnectionIndicator(text)
@@ -73,6 +76,7 @@ final class ActiveSessions {
     func end(_ id: Int) {
         lock.lock()
         names[id] = nil
+        killers[id] = nil
         let empty = names.isEmpty
         let text = label()
         lock.unlock()
@@ -83,6 +87,14 @@ final class ActiveSessions {
             showConnectionIndicator(text)
         }
         onChange?()
+    }
+
+    /// 接続中のセッションをすべてホスト側から切る
+    func disconnectAll(reason: String) {
+        lock.lock()
+        let ks = Array(killers.values)
+        lock.unlock()
+        for k in ks { k(reason) }
     }
 
     private func label() -> String {
@@ -101,6 +113,8 @@ final class HostSession {
     private let ackSemaphore = DispatchSemaphore(value: 0)
     private let stateLock = NSLock()
     private var closed = false
+    /// 監視スレッドやホストの操作で切ったときの理由 (送信ループの理由より優先)
+    private var killReason: String?
     private var keyframeRequested = false
     /// ビューアが frame2 (通信量の少ない形式) を受け取れる
     private var viewerSupportsFrame2 = false
@@ -144,15 +158,51 @@ final class HostSession {
         return r
     }
 
+    /// 理由を付けてセッションを終わらせる (どのスレッドからでもよい)。
+    /// 通信路を閉じるので、送信で止まっている送信ループも戻ってくる
+    func kill(_ reason: String) {
+        stateLock.lock()
+        let first = killReason == nil && !closed
+        if first { killReason = reason }
+        stateLock.unlock()
+        if first { markClosed() }
+    }
+
     func run() {
-        let token = ActiveSessions.shared.begin(client.name)
+        let token = ActiveSessions.shared.begin(client.name) { [weak self] in self?.kill($0) }
+        // TCP なら送信にも期限を付ける (受け取らない相手に、いつまでも送り続けて止まらないように)
+        (channel.stream as? TCPConnection)?.setSendTimeout(30)
         let receiver = Thread { [self] in receiveLoop() }
         receiver.start()
-        let reason = sendLoop()
+        // 失効・無操作・最長時間の確認は、送信ループとは別のスレッドで行う。
+        // 送信ループは相手が受け取らないと送信で止まるので、そこで確認すると切断できなくなる
+        let watchdog = Thread { [self] in watchLoop() }
+        watchdog.start()
+        var reason = sendLoop()
         markClosed()
+        stateLock.lock()
+        if let k = killReason { reason = k }
+        stateLock.unlock()
         audit.record("SESSION_END name=\(client.name) peer=\(client.peer) reason=\(reason) sent_kb=\(totalSent / 1024)")
         hostLog("通信量: このセッションで計 \(formatBytes(totalSent)) を送信しました")
         ActiveSessions.shared.end(token)
+    }
+
+    /// 1 秒ごとに、端末がまだ許可されているか・時間切れでないかを確かめる
+    private func watchLoop() {
+        while !isClosed {
+            Thread.sleep(forTimeInterval: 1)
+            if isClosed { return }
+            if !gate.isStillAuthorized(client.publicKey) {
+                audit.record("SESSION_KILLED reason=device_revoked name=\(client.name) peer=\(client.peer)")
+                kill("device_revoked")
+                return
+            }
+            if let r = expired(now: Date()) {
+                kill(r)
+                return
+            }
+        }
     }
 
     /// 無操作・最長時間を超えていれば理由を返す
@@ -173,7 +223,6 @@ final class HostSession {
     /// 終了理由を返す
     private func sendLoop() -> String {
         let interval = 1.0 / max(1, options.fps)
-        var lastAuthCheck = Date()
         while !isClosed {
             guard let capturer = makeCapturer(scale: options.scale) else {
                 hostLog("画面キャプチャを初期化できません。1 秒後に再試行します")
@@ -197,14 +246,7 @@ final class HostSession {
 
             while !isClosed {
                 let start = Date()
-                if start.timeIntervalSince(lastAuthCheck) > 2 {
-                    lastAuthCheck = start
-                    if !gate.isStillAuthorized(client.publicKey) {
-                        audit.record("SESSION_KILLED reason=device_revoked name=\(client.name) peer=\(client.peer)")
-                        return "device_revoked"
-                    }
-                    if let r = expired(now: start) { return r }
-                }
+                // 失効・時間切れの確認は監視スレッド (watchLoop) が行う
                 if capturer.needsRecreate { break } // 解像度変更 → hello から送り直す
                 if takeKeyframeRequest() { encoder.reset() }
                 encoder.format = frameFormat
