@@ -81,7 +81,7 @@ final class HostWindow {
         fBodyBold = makeFont("Segoe UI", px(13.5), bold: true)
         fSmall = makeFont("Segoe UI", px(12))
         fMono = makeFont("Consolas", px(13))
-        fCode = makeFont("Consolas", px(30), bold: true)
+        fCode = makeFont("Consolas", px(24), bold: true)
         fIcon = makeFont("Segoe MDL2 Assets", px(17))
         fIconSmall = makeFont("Segoe MDL2 Assets", px(12))
         fStatus = makeFont("Segoe UI", px(21), bold: true)
@@ -210,12 +210,12 @@ final class HostWindow {
         button("接続先をコピー", R(right, 180, 190, 36), id: ID.copyEndpoint, page: 0, kind: .secondary, on: Palette.card)
         // 端末
         add("LISTBOX", "", Style.lbsNotify | Style.lbsOwnerDrawFixed | Style.lbsNoIntegralHeight | Style.vScroll,
-            R(cx + 20, 176, cw - 40, 400), id: ID.devices, page: 1)
+            R(cx + 20, 184, cw - 40, 392), id: ID.devices, page: 1)
         button("選んだ端末を取り消す", R(cx, 612, 210, 42), id: ID.revoke, page: 1, kind: .danger, on: Palette.content)
         button("すべて消去", R(cx + 222, 612, 150, 42), id: ID.resetDevices, page: 1, kind: .secondary, on: Palette.content)
         // 設定
         let lx = cx + 24, ctl = cx + 200
-        func row(_ i: Int) -> Int { 168 + i * 34 }
+        func row(_ i: Int) -> Int { 186 + i * 34 }
         edit(R(ctl, row(0) - 2, 470, 28), id: ID.relayURL, page: 2, cue: "https://xxxx.onrender.com")
         combo(R(ctl, row(1) - 2, 220, 28), id: ID.transport, items: ["自動 (WebSocket → HTTP)", "WebSocket", "HTTP"])
         checkbox("同じ Wi-Fi からの直接接続を受け付ける", R(ctl, row(2), 330, 26), id: ID.direct)
@@ -235,7 +235,7 @@ final class HostWindow {
         _ = lx
         // ログ
         add("EDIT", "", Style.esMultiline | Style.esReadOnly | Style.esAutoVScroll | Style.vScroll,
-            R(cx + 20, 168, cw - 40, 416), id: ID.log, page: 3, ex: Style.exClientEdge, font: fMono)
+            R(cx + 20, 184, cw - 40, 400), id: ID.log, page: 3, ex: Style.exClientEdge, font: fMono)
         button("監査ログを検証", R(cx, 612, 170, 42), id: ID.verifyLog, page: 3, kind: .secondary, on: Palette.content)
         button("データのフォルダを開く", R(cx + 182, 612, 210, 42), id: ID.openFolder, page: 3, kind: .secondary,
                on: Palette.content)
@@ -314,7 +314,7 @@ final class HostWindow {
     }
 
     private var navItems: [(glyph: String, title: String)] {
-        [("\u{E80F}", "ホーム"), ("\u{E8EA}", "端末"), ("\u{E713}", "設定"), ("\u{E8A5}", "ログ")]
+        [("\u{E80F}", "ホーム"), ("\u{E772}", "端末"), ("\u{E713}", "設定"), ("\u{E81C}", "ログ")]
     }
 
     private func navRect(_ i: Int) -> RECT { R(14, headerH + 24 + i * 52, sidebarW - 28, 44) }
@@ -410,6 +410,8 @@ final class HostWindow {
         for d in devices {
             _ = withWide(d.name) { SendMessageW(lb, Msg.lbAddString, 0, lparam(UnsafeMutableRawPointer(mutating: $0))) }
         }
+        // 1 台もなければ一覧を隠して、案内の文を見せる
+        if page == 1 { _ = ShowWindow(lb, devices.isEmpty ? 0 : 5) }
         if let h = hwnd { _ = InvalidateRect(h, nil, false) }
     }
 
@@ -817,8 +819,8 @@ final class HostWindow {
     }
 
     private func drawDevicesPage(_ p: Painter) {
-        card(p, y: 112, h: 482, title: "登録済みの端末 (\(devices.count) 台)", glyph: "\u{E8EA}")
-        p.text("取り消した端末は接続できなくなります (接続中なら切断)。", R(contentX + 60, 146, contentW - 100, 22),
+        card(p, y: 112, h: 482, title: "登録済みの端末 (\(devices.count) 台)", glyph: "\u{E772}")
+        p.text("取り消した端末は接続できなくなります (接続中なら切断)。", R(contentX + 60, 154, contentW - 100, 22),
                font: fSmall, color: Palette.sub)
         if devices.isEmpty {
             p.text("まだ登録された端末はありません。ホームの「ペアリングコードを表示」から登録してください。",
@@ -853,24 +855,24 @@ final class HostWindow {
 
     private func drawSettingsPage(_ p: Painter) {
         card(p, y: 112, h: 556, title: "設定", glyph: "\u{E713}")
-        p.text("保存すると、待ち受け中なら新しい設定で始め直します。", R(contentX + 60, 146, contentW - 260, 22),
+        p.text("保存すると、待ち受け中なら新しい設定で始め直します。", R(contentX + 60, 154, contentW - 260, 22),
                font: fSmall, color: Palette.sub)
         let labels = ["中継サーバーの URL", "中継の通り道", "直接接続", "Bonjour", "接続の確認", "切断したとき",
                       "無操作で切断", "画質", "送信量の上限", "耐量子暗号", "起動したとき", "閉じるボタン", "サインイン時"]
         for (i, l) in labels.enumerated() {
-            p.text(l, R(contentX + 24, 168 + i * 34, 170, 26), font: fBodyBold, color: Palette.text)
+            p.text(l, R(contentX + 24, 186 + i * 34, 170, 26), font: fBodyBold, color: Palette.text)
         }
         let ctlX = contentX + 200
-        p.text("ポート", R(ctlX + 350, 168 + 2 * 34, 56, 26), font: fSmall, color: Palette.sub)
-        p.text("分", R(ctlX + 90, 168 + 6 * 34, 40, 26), font: fBody, color: Palette.sub)
-        p.text("fps", R(ctlX + 90, 168 + 7 * 34, 50, 26), font: fBody, color: Palette.sub)
-        p.text("kbps (0 = 無制限。無料の中継サーバーなら 500 程度)", R(ctlX + 110, 168 + 8 * 34, 380, 26), font: fSmall,
+        p.text("ポート", R(ctlX + 350, 186 + 2 * 34, 56, 26), font: fSmall, color: Palette.sub)
+        p.text("分", R(ctlX + 90, 186 + 6 * 34, 40, 26), font: fBody, color: Palette.sub)
+        p.text("fps", R(ctlX + 90, 186 + 7 * 34, 50, 26), font: fBody, color: Palette.sub)
+        p.text("kbps (0 = 無制限。無料の中継サーバーなら 500 程度)", R(ctlX + 110, 186 + 8 * 34, 380, 26), font: fSmall,
                color: Palette.sub)
     }
 
     private func drawLogPage(_ p: Painter) {
-        card(p, y: 112, h: 486, title: "ログ", glyph: "\u{E8A5}")
-        p.text("接続・認証・通信量の記録です。監査ログはハッシュの鎖で改ざんを検知できます。", R(contentX + 60, 140, contentW - 100, 22),
+        card(p, y: 112, h: 486, title: "ログ", glyph: "\u{E81C}")
+        p.text("接続・認証・通信量の記録です。監査ログはハッシュの鎖で改ざんを検知できます。", R(contentX + 60, 154, contentW - 100, 22),
                font: fSmall, color: Palette.sub)
     }
 
