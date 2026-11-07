@@ -21,6 +21,10 @@ struct HostOptions {
     var onDisconnect = DisconnectAction.blank
     var requirePostQuantum = false
     var allowAdmin = false
+    /// 画面データの送信量の上限 (kbps)。0 で無制限。無料の中継サーバーの月間転送量を守るため
+    var maxKbps: Double = 0
+    /// 通信量をこの秒数ごとに表示する。0 で表示しない
+    var statsInterval: TimeInterval = 60
 }
 
 /// 接続中のセッション。画面上部の「接続中」表示と、最後の切断時の画面保護を受け持つ。
@@ -73,6 +77,8 @@ final class HostSession {
     private let stateLock = NSLock()
     private var closed = false
     private var keyframeRequested = false
+    /// ビューアが frame2 (通信量の少ない形式) を受け取れる
+    private var viewerSupportsFrame2 = false
     private var lastInput = Date()
     private let started = Date()
     // 入力座標の変換用 (フレーム座標 → 実画面座標)
@@ -101,6 +107,11 @@ final class HostSession {
         ackSemaphore.signal()
     }
 
+    private var frameFormat: FrameFormat {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return viewerSupportsFrame2 ? .v2 : .v1
+    }
+
     private func takeKeyframeRequest() -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         let r = keyframeRequested
@@ -114,7 +125,8 @@ final class HostSession {
         receiver.start()
         let reason = sendLoop()
         markClosed()
-        audit.record("SESSION_END name=\(client.name) peer=\(client.peer) reason=\(reason)")
+        audit.record("SESSION_END name=\(client.name) peer=\(client.peer) reason=\(reason) sent_kb=\(totalSent / 1024)")
+        print("通信量: このセッションで計 \(formatBytes(totalSent)) を送信しました")
         ActiveSessions.shared.end(token)
     }
 
@@ -129,6 +141,9 @@ final class HostSession {
     }
 
     // MARK: 画面送信
+
+    /// このセッションで送った画面データのバイト数
+    private var totalSent = 0
 
     /// 終了理由を返す
     private func sendLoop() -> String {
@@ -152,6 +167,8 @@ final class HostSession {
                 return "disconnected"
             }
             let encoder = FrameEncoder(width: capturer.width, height: capturer.height)
+            var lastStats = Date()
+            var statsBase = FrameStats()
 
             while !isClosed {
                 let start = Date()
@@ -165,19 +182,40 @@ final class HostSession {
                 }
                 if capturer.needsRecreate { break } // 解像度変更 → hello から送り直す
                 if takeKeyframeRequest() { encoder.reset() }
+                encoder.format = frameFormat
 
+                // 画面が変わらなければ、何も送らない (止まったあとの高画質化だけは送る)
+                var minInterval = interval
                 if let image = capturer.capture(),
                    let payload = encoder.encode(image, srcStride: capturer.bytesPerRow) {
                     do {
-                        try channel.send(.frame, payload)
+                        try channel.send(encoder.format == .v2 ? .frame2 : .frame, payload)
                     } catch {
                         return "disconnected"
+                    }
+                    totalSent += payload.count + 5
+                    // 上限があれば、送った量に見合う時間を空ける
+                    if options.maxKbps > 0 {
+                        minInterval = max(minInterval, Double(payload.count + 5) * 8 / (options.maxKbps * 1000))
                     }
                     // ビューアが処理し終えるまで次を送らない (遅い回線で溜まらないように)
                     _ = ackSemaphore.wait(timeout: .now() + 5)
                 }
+                if options.statsInterval > 0, Date().timeIntervalSince(lastStats) >= options.statsInterval {
+                    let s = encoder.stats
+                    let bytes = s.bytes - statsBase.bytes
+                    if bytes > 0 {
+                        let secs = Date().timeIntervalSince(lastStats)
+                        print(String(format: "通信量: 直近 %.0f 秒で %@ (平均 %.0f kbps) / 送信 %d 回・タイル 可逆 %d 粗い %d 高画質化 %d",
+                                     secs, formatBytes(bytes), Double(bytes) * 8 / secs / 1000,
+                                     s.frames - statsBase.frames, s.losslessTiles - statsBase.losslessTiles,
+                                     s.lossyTiles - statsBase.lossyTiles, s.refinedTiles - statsBase.refinedTiles))
+                    }
+                    statsBase = s
+                    lastStats = Date()
+                }
                 let elapsed = Date().timeIntervalSince(start)
-                if elapsed < interval { Thread.sleep(forTimeInterval: interval - elapsed) }
+                if elapsed < minInterval { Thread.sleep(forTimeInterval: minInterval - elapsed) }
             }
         }
         return "disconnected"
@@ -200,7 +238,7 @@ final class HostSession {
 
     private func handle(_ event: ClientEvent) {
         switch event {
-        case .frameAck, .requestKeyframe:
+        case .frameAck, .requestKeyframe, .capabilities:
             break
         default:
             stateLock.lock(); lastInput = Date(); stateLock.unlock()
@@ -211,6 +249,10 @@ final class HostSession {
         case .requestKeyframe:
             stateLock.lock()
             keyframeRequested = true
+            stateLock.unlock()
+        case let .capabilities(flags):
+            stateLock.lock()
+            viewerSupportsFrame2 = flags & ViewerCapability.frame2 != 0
             stateLock.unlock()
         case let .mouseMove(x, y):
             stateLock.lock()
@@ -229,4 +271,10 @@ final class HostSession {
             injector.text(s)
         }
     }
+}
+
+func formatBytes(_ n: Int) -> String {
+    if n >= 1 << 20 { return String(format: "%.1f MB", Double(n) / Double(1 << 20)) }
+    if n >= 1 << 10 { return String(format: "%.0f KB", Double(n) / Double(1 << 10)) }
+    return "\(n) B"
 }

@@ -32,6 +32,7 @@ func usage() -> Never {
       --port N          待ち受けポート (既定 \(defaultPort))
       --fps N           最大フレームレート (既定 30)
       --scale N         縮小率。2 なら縦横 1/2 で送信 (既定 1)
+      --max-kbps N      画面データの送信量の上限 (kbps)。無料の中継サーバーの月間転送量を守るとき (例: 500)
 
     端末の管理:
       --list            登録済みの端末を表示
@@ -54,6 +55,7 @@ while let a = args.next() {
     case "--bind": options.bindAddress = args.next()
     case "--fps": options.fps = min(60, max(1, args.next().flatMap { Double($0) } ?? options.fps))
     case "--scale": options.scale = min(8, max(1, args.next().flatMap { Int($0) } ?? options.scale))
+    case "--max-kbps": options.maxKbps = max(0, args.next().flatMap { Double($0) } ?? 0)
     case "--pair": options.pair = true
     case "--confirm": options.confirm = true
     case "--relay":
