@@ -18,7 +18,7 @@
 | `Sources/RDCore/Security/Auth.swift` | 認証・ペアリング・レート制限・LAN 限定 | 認証前に資源を食わせられないか、ペアリング証明の結び付け、`isLocalNetwork` の判定、TOCTOU、拒否時の情報漏えい |
 | `Sources/RDCore/Security/Identity.swift` | ペアリングコード・指紋・Base32 | 指紋 80bit + 秘密 40bit の強度の妥当性、比較の定数時間性 |
 | `Sources/RDCore/Security/Storage.swift` | DPAPI / キーチェーン / ファイル権限 / 監査ログ | 権限、原子的書き込み、ログインジェクション |
-| `Sources/RDCore/TileCodec.swift` | 画面データのデコード | 境界チェック（悪意あるホスト → ビューアのメモリ破壊がないか） |
+| `Sources/RDCore/TileCodec.swift` | 画面データのデコード（RLE24・パレット・HALF565） | 境界チェック（悪意あるホスト → ビューアのメモリ破壊がないか）、パレットの索引の範囲、HALF565 の端の画素 |
 | `Sources/RDCore/Protocol.swift`, `Bytes.swift` | メッセージの解析 | 長さ・範囲の検証 |
 | `Sources/RDCore/WebSocket.swift` | WebSocket クライアント 3 種 | 最小実装（Linux 用）のフレーム解析、WinHTTP の TLS 設定 |
 | `Sources/RDCore/Relay.swift` | 中継経由の待ち受け、WebSocket と HTTP の切り替え | 中継サーバーからの制御メッセージを信用していないか |

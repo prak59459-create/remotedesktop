@@ -31,6 +31,7 @@ func fuzzOne(_ target: UInt8, _ data: [UInt8]) {
         let fb = Framebuffer()
         fb.resize(width: 97, height: 61)
         _ = try? fb.apply(data)
+        _ = try? fb.apply(data, format: .v2) // frame2 (パレット・HALF565)
     case 1: // RLE 単体
         var dst = [UInt8](repeating: 0, count: 64 * 64 * 4)
         dst.withUnsafeMutableBytes { d in

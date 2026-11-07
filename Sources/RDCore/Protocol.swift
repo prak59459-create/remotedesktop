@@ -12,6 +12,7 @@ public enum MessageType: UInt8 {
     // ホスト → ビューア
     case hello = 1            // magic u32, width u32, height u32
     case frame = 2            // FrameEncoder の出力 (変更タイルの集合)
+    case frame2 = 3           // FrameEncoder の出力 (v2: タイルごとに形式つき。capabilities で対応を伝えたビューアにだけ送る)
 
     // ビューア → ホスト
     case frameAck = 10        // フレームを処理し終えた (フロー制御)
@@ -21,6 +22,7 @@ public enum MessageType: UInt8 {
     case key = 14             // code u16, flags u8
     case requestKeyframe = 15 // 全画面を送り直してもらう
     case text = 16            // 文字列入力 (UTF-8)。ソフトウェアキーボードや IME の確定文字
+    case capabilities = 17    // flags u32 (ViewerCapability)。古いホストは知らない種類として無視する
 
     // 認証 (暗号化チャネル確立後、画面配信の前)
     case authRequest = 20     // AuthRequest
@@ -76,6 +78,7 @@ public enum ClientEvent: Equatable {
     case mouseWheel(dx: Int32, dy: Int32)
     case key(code: UInt16, down: Bool, virtualKey: Bool)
     case text(String)
+    case capabilities(UInt32)
 
     public static let maxTextBytes = 1024
 
@@ -101,6 +104,9 @@ public enum ClientEvent: Equatable {
             return (.key, w.bytes)
         case let .text(s):
             return (.text, Array(Array(s.utf8).prefix(Self.maxTextBytes)))
+        case let .capabilities(flags):
+            w.u32(flags)
+            return (.capabilities, w.bytes)
         }
     }
 
@@ -122,7 +128,8 @@ public enum ClientEvent: Equatable {
         case .text:
             guard payload.count <= maxTextBytes else { return nil }
             return .text(String(decoding: payload, as: UTF8.self))
-        case .hello, .frame, .authRequest, .authResult: return nil
+        case .capabilities: return .capabilities(try r.u32())
+        case .hello, .frame, .frame2, .authRequest, .authResult: return nil
         }
     }
 }

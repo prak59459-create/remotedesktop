@@ -135,8 +135,10 @@ final class ViewerSession: ObservableObject {
                     let h = try Hello.decode(payload)
                     framebuffer.resize(width: h.width, height: h.height)
                     DispatchQueue.main.async { self.remoteSize = CGSize(width: h.width, height: h.height) }
-                case .frame:
-                    try framebuffer.apply(payload)
+                    // 通信量の少ない形式を受け取れることを伝える (古いホストは無視する)
+                    try ch.send(.capabilities(ViewerCapability.frame2))
+                case .frame, .frame2:
+                    try framebuffer.apply(payload, format: type == MessageType.frame2.rawValue ? .v2 : .v1)
                     try ch.send(.frameAck)
                     if let img = makeImage(framebuffer) { onImage?(img) }
                 default:
