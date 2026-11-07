@@ -64,7 +64,10 @@ public struct Hello: Equatable {
         var r = ByteReader(payload)
         guard try r.u32() == protocolMagic else { throw ProtocolError.invalid("magic が一致しません") }
         let w = Int(try r.u32()), h = Int(try r.u32())
-        guard w > 0, h > 0, w <= 16384, h <= 16384 else { throw ProtocolError.invalid("画面サイズ \(w)x\(h)") }
+        // 悪意あるホストに巨大な画面バッファ (16384² × 4 = 1GiB) を確保させないよう、8K (7680x4320) 相当までに制限
+        guard w > 0, h > 0, w <= 8192, h <= 8192, w * h <= 7680 * 4320 else {
+            throw ProtocolError.invalid("画面サイズ \(w)x\(h)")
+        }
         return Hello(width: w, height: h)
     }
 }

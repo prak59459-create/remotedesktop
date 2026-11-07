@@ -217,6 +217,10 @@ public final class RelayHostListener {
     private var backoff = 2.0
 
     private let token: [UInt8]
+    /// 中継サーバーからの「ビューアが来た」通知で、同時に受け取りに行く数の上限。
+    /// 悪意ある中継サーバーが通知を大量に送っても、スレッドや接続を際限なく作らない
+    static let maxConcurrentAccepts = 6
+    private var acceptsInFlight = 0
 
     /// 最初の接続そのものに失敗した (通り道の問題かもしれないので、auto ならもう一方を試す)
     private struct ConnectFailed: Error {
@@ -383,8 +387,19 @@ public final class RelayHostListener {
               id.allSatisfy({ $0.isHexDigit }) else { return }
         // ip は中継サーバーの申告 (信用はしない。レート制限のキーにだけ使う)
         let ip = sanitize((obj["ip"] as? String) ?? "?", maxLength: 64)
+        lock.lock()
+        guard acceptsInFlight < Self.maxConcurrentAccepts else {
+            lock.unlock()
+            log("RELAY_ACCEPT_SKIPPED reason=too_many_in_flight")
+            return
+        }
+        acceptsInFlight += 1
+        lock.unlock()
         let relay = self.relay, room = self.room, log = self.log
-        Thread {
+        Thread { [weak self] in
+            defer {
+                self?.lock.lock(); self?.acceptsInFlight -= 1; self?.lock.unlock()
+            }
             do {
                 if http {
                     onIncoming(try HTTPRelayTransport.accept(relay: relay, room: room, id: id, peerIP: ip))

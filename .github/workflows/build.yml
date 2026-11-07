@@ -14,10 +14,9 @@ permissions:
 jobs:
   windows-exe:
     runs-on: windows-latest
+    # 署名の権限はここには付けない (npm ci やテストと同じジョブで使わない)。署名は attest ジョブで行う
     permissions:
       contents: read
-      id-token: write      # 出どころ証明 (Sigstore) の署名に使う
-      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -58,21 +57,35 @@ jobs:
           name: screenshots-windows
           path: screenshots-windows
           if-no-files-found: ignore
-      - name: Attest build provenance
-        # 同じリポジトリからの実行だけ (フォークの PR には署名権限を与えない)
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        with:
-          subject-path: |
-            dist/RDHost/RDHost.exe
-            dist/RDHost/RemoteDesktopHost.exe
-            dist/RDHost-windows-x64.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: RDHost-windows-x64
           path: |
             dist/RDHost/
             dist/SHA256SUMS.txt
+
+  # 出どころ証明 (Sigstore) の署名だけを行うジョブ。依存パッケージの導入やテストは動かさず、
+  # windows-exe が作った成果物を受け取って署名する (署名の権限を最小のステップに閉じ込める)
+  attest:
+    needs: windows-exe
+    # 同じリポジトリからの実行だけ (フォークの PR には署名権限を与えない)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write      # 出どころ証明 (Sigstore) の署名に使う
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: RDHost-windows-x64
+          path: dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/RDHost/RDHost.exe
+            dist/RDHost/RemoteDesktopHost.exe
 
   macos-viewer:
     runs-on: macos-15

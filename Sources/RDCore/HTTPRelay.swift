@@ -351,6 +351,14 @@ public final class HTTPRelayTransport: Transport {
     }
 }
 
+/// ファジング用の入口: 中継サーバーの応答 (leg の JSON) の解析
+public enum HTTPRelayLegFuzz {
+    public static func run(_ data: [UInt8]) {
+        _ = HTTPRelayTransport.parseLeg(data)
+        _ = RelayRoom.isValid(String(decoding: data, as: UTF8.self))
+    }
+}
+
 /// ファジング用の入口 (RDFuzz から使う)
 public enum HTTPRelayFrameFuzz {
     public static func run(_ data: [UInt8]) {

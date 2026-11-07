@@ -97,5 +97,9 @@ let package = Package(
             name: "RDCoreTests",
             dependencies: ["RDCore"]
         ),
+        .testTarget(
+            name: "RDHostKitTests",
+            dependencies: ["RDHostKit", "RDCore"]
+        ),
     ]
 )

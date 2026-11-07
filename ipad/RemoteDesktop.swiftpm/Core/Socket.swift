@@ -23,6 +23,12 @@ private let kIPPROTO_TCP: Int32 = 6
 private let kTCP_NODELAY: Int32 = 1
 private let kAI_PASSIVE: Int32 = 1
 
+#if os(Windows)
+private let kSO_RCVTIMEO: Int32 = 0x1006, kSO_SNDTIMEO: Int32 = 0x1005
+#else
+private let kSO_RCVTIMEO = SO_RCVTIMEO, kSO_SNDTIMEO = SO_SNDTIMEO
+#endif
+
 public enum NetError: Error, CustomStringConvertible {
     case resolve(String)
     case connect(String)
@@ -261,20 +267,29 @@ public final class TCPConnection: ByteStream {
         return out
     }
 
+    /// 送信タイムアウト (秒)。0 で無効。相手が受け取らないまま送信で止まり続けないように使う
+    public func setSendTimeout(_ seconds: Double) {
+        setTimeout(seconds, option: kSO_SNDTIMEO)
+    }
+
     /// 受信タイムアウト (秒)。0 で無効。認証前の接続を長く占有させないために使う。
     public func setReceiveTimeout(_ seconds: Double) {
+        setTimeout(seconds, option: kSO_RCVTIMEO)
+    }
+
+    private func setTimeout(_ seconds: Double, option: Int32) {
         #if os(Windows)
         var ms = DWORD(max(0, seconds) * 1000)
         _ = withUnsafePointer(to: &ms) {
             $0.withMemoryRebound(to: CChar.self, capacity: 4) {
-                setsockopt(fd, 0xFFFF /* SOL_SOCKET */, 0x1006 /* SO_RCVTIMEO */, $0, Int32(MemoryLayout<DWORD>.size))
+                setsockopt(fd, 0xFFFF /* SOL_SOCKET */, option, $0, Int32(MemoryLayout<DWORD>.size))
             }
         }
         #else
         var tv = timeval()
         tv.tv_sec = Int(seconds)
         tv.tv_usec = numericCast(Int((seconds - Double(Int(seconds))) * 1_000_000))
-        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, option, &tv, socklen_t(MemoryLayout<timeval>.size))
         #endif
     }
 

@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('node:crypto');
 const WebSocket = require('ws');
-const { server, config, roomFromToken, base32 } = require('../server');
+const { server, wss, config, rooms, totals, connsPerIP, roomFromToken, base32 } = require('../server');
 
 let base;
 
@@ -12,7 +12,12 @@ test.before(async () => {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   base = `ws://127.0.0.1:${server.address().port}`;
 });
-test.after(() => server.close());
+test.after(() => {
+  // 残っている接続も閉じる (閉じないと、Node のバージョンによってはテストのプロセスが終わらない)
+  for (const ws of wss.clients) ws.terminate();
+  if (server.closeAllConnections) server.closeAllConnections();
+  server.close();
+});
 
 function open(path) {
   return new Promise((resolve, reject) => {
@@ -127,7 +132,9 @@ test('oversized messages are rejected', async () => {
   const { viewer, acc } = await session(h);
   const c = closed(viewer);
   viewer.send(Buffer.alloc(config.maxMessage + 1));
-  assert.strictEqual(await c, 1009);
+  // サーバーは 1009 で閉じる。Node のバージョンによっては、クライアントには異常切断 (1006) として見える
+  const code = await c;
+  assert.ok([1009, 1006].includes(code), 'closed with ' + code);
   acc.close();
   h.ws.close();
 });
@@ -163,10 +170,10 @@ test('many sessions in a row are not blocked by the per-IP limit', async () => {
 
 // MARK: - HTTP の通り道
 
-function req(method, path, body) {
+function req(method, path, body, localAddress) {
   const u = new URL(base.replace('ws://', 'http://') + path);
   return new Promise((resolve, reject) => {
-    const r = require('http').request(u, { method, agent: false }, (res) => {
+    const r = require('http').request(u, { method, agent: false, localAddress }, (res) => {
       const parts = [];
       res.on('data', (d) => parts.push(d));
       res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
@@ -346,4 +353,79 @@ test('http: unknown legs, oversized posts and leg ids are not guessable', async 
   assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.alloc(config.maxSendBody + 1))).status, 413);
   assert.strictEqual((await post(`/h/send?leg=${v}&seq=1`, Buffer.from([1]))).status, 410);
   h.ws.close();
+});
+
+test('http: hosts count toward the per-IP connection limit', async () => {
+  // ほかのテストの接続と混ざらないよう、別の送信元アドレス (127.0.0.2) から試す
+  const from = '127.0.0.2';
+  const poll = (t, hid) => req('POST', '/h/host?room=' + roomFromToken(t), JSON.stringify({ t: 'auth', token: t, hid }), from);
+  const saved = [config.maxConnsPerIP, config.maxNewConnsPerMinute];
+  config.maxConnsPerIP = 1;
+  config.maxNewConnsPerMinute = 1000;
+  const t1 = newToken(), t2 = newToken();
+  try {
+    const hid = newHid();
+    assert.strictEqual((await poll(t1, hid)).status, 200);
+    assert.strictEqual(connsPerIP.get(from), 1); // HTTP のホストも 1 つの接続として数える
+    // 上限 1 に達しているので、同じ IP から別の部屋のホストは登録できない
+    assert.strictEqual((await poll(t2, newHid())).status, 429);
+    assert.ok(!rooms.has(roomFromToken(t2)));
+    // 登録済みのホストのポーリングは、上限に関係なく続けられる
+    const again = poll(t1, hid);
+    await new Promise((r) => setTimeout(r, 50));
+    rooms.get(roomFromToken(t1)).host.notify({ t: 'incoming', id: '0'.repeat(32), ip: 'x' });
+    assert.strictEqual((await again).status, 200);
+  } finally {
+    [config.maxConnsPerIP, config.maxNewConnsPerMinute] = saved;
+    const st = rooms.get(roomFromToken(t1));
+    if (st) st.host.dead = true;
+  }
+});
+
+test('ALLOWED_ROOMS limits the relay to the listed rooms', async () => {
+  const mine = newToken();
+  const myRoom = roomFromToken(mine);
+  config.allowedRooms = new Set([myRoom]);
+  try {
+    // 他人の部屋はホストも接続もできない
+    assert.strictEqual((await hostPoll(newToken(), newHid())).status, 404);
+    await assert.rejects(open('/host?room=' + roomFromToken(newToken())), /HTTP 404/);
+    // 自分の部屋は使える
+    assert.strictEqual((await hostPoll(mine, newHid())).status, 200);
+  } finally {
+    config.allowedRooms = new Set();
+    const st = rooms.get(myRoom);
+    if (st) st.host.dead = true;
+  }
+});
+
+test('server-wide limits: queued memory and daily bytes end sessions', async () => {
+  const savedQ = config.maxTotalQueued;
+  const savedDaily = config.dailyBytesLimit;
+  try {
+    // 受け取らない HTTP のビューアに送り続けると、全体の上限で切られる
+    config.maxTotalQueued = 200 * 1024;
+    const h = await host(newToken());
+    const v = getJSON(await post('/h/connect?room=' + h.room)).leg;
+    const inc = JSON.parse((await next(h.ws)).d.toString());
+    const acc = await open(`/accept?room=${h.room}&id=${inc.id}`);
+    const c = closed(acc);
+    for (let i = 0; i < 6; i++) acc.send(Buffer.alloc(60 * 1024));
+    await c;
+    assert.strictEqual(totals.queued, 0); // 閉じたら溜めていた分はすぐ捨てる
+    assert.strictEqual((await req('GET', `/h/recv?leg=${v}&mode=poll&seq=1`)).status, 410);
+    config.maxTotalQueued = savedQ;
+
+    // 1 日の上限を超えたら、それ以上は中継しない
+    config.dailyBytesLimit = totals.dayBytes + 1000;
+    const { viewer, acc: acc2 } = await session(h);
+    const c2 = closed(viewer);
+    viewer.send(Buffer.alloc(2000));
+    assert.strictEqual(await c2, 4029);
+    await closed(acc2);
+    h.ws.close();
+  } finally {
+    config.maxTotalQueued = savedQ;
+    config.dailyBytesLimit = savedDaily;
+  }
 });

@@ -250,6 +250,31 @@ public final class HostGatekeeper {
     private var pending = 0
     private let lock = NSLock()
 
+    /// 認証前の出来事 (失敗・拒否) を監査ログに書くのは 1 分にこれだけ。
+    /// 認証前の接続だけでディスクを埋めたり、イベントログの古い記録を押し流したりできないように
+    public var maxPreAuthAuditPerMinute = 60
+    private var preAuthWindowStart = Date()
+    private var preAuthCount = 0
+    private var preAuthSuppressed = 0
+
+    /// 認証前の記録 (回数制限つき)
+    private func preAuthAudit(_ line: String) {
+        lock.lock()
+        let now = Date()
+        var summary: String?
+        if now.timeIntervalSince(preAuthWindowStart) >= 60 {
+            if preAuthSuppressed > 0 { summary = "PREAUTH_SUPPRESSED count=\(preAuthSuppressed)" }
+            preAuthWindowStart = now
+            preAuthCount = 0
+            preAuthSuppressed = 0
+        }
+        let allowed = preAuthCount < maxPreAuthAuditPerMinute
+        if allowed { preAuthCount += 1 } else { preAuthSuppressed += 1 }
+        lock.unlock()
+        if let s = summary { audit.record(s) }
+        if allowed { audit.record(line) }
+    }
+
     public init(identity: StaticIdentity, clients: TrustStore, audit: AuditLog) {
         self.identity = identity
         self.clients = clients
@@ -280,7 +305,7 @@ public final class HostGatekeeper {
         let ip = tcp.peerIP
 
         if let wait = limiter.blockedFor(ip) {
-            audit.record("BLOCKED ip=\(ip) remaining=\(Int(wait))s")
+            preAuthAudit("BLOCKED ip=\(ip) remaining=\(Int(wait))s")
             tcp.close()
             throw AuthError.rateLimited(seconds: Int(wait))
         }
@@ -295,12 +320,16 @@ public final class HostGatekeeper {
         defer { lock.lock(); pending -= 1; lock.unlock() }
 
         tcp.setReceiveTimeout(handshakeTimeout)
+        // 受信 1 回ごとのタイムアウトだけだと、少しずつ送り続ける接続はいつまでも切れない。
+        // 認証の手続き全体 (ハンドシェイク + 認証要求) にも期限を付け、過ぎたら接続を閉じる (失敗として数える)
+        let deadline = AuthDeadline(tcp, after: handshakeTimeout * 1.5)
+        defer { deadline.disarm() }
         let secure: SecureStream
         do {
             secure = try SecureStream.accept(tcp, identity: identity, requirePostQuantum: requirePostQuantum)
         } catch {
             limiter.recordFailure(ip)
-            audit.record("HANDSHAKE_FAIL peer=\(peer) error=\(error)")
+            preAuthAudit("HANDSHAKE_FAIL peer=\(peer) error=\(deadline.fired ? "deadline" : "\(error)")")
             tcp.close()
             throw error
         }
@@ -310,7 +339,7 @@ public final class HostGatekeeper {
 
         func reject(_ st: AuthStatus, _ msg: String, countFailure: Bool = true) -> AuthError {
             if countFailure { limiter.recordFailure(ip) }
-            audit.record("AUTH_REJECT peer=\(peer) device=\(fp) status=\(st) reason=\(msg)")
+            preAuthAudit("AUTH_REJECT peer=\(peer) device=\(fp) status=\(st) reason=\(msg)")
             try? pre.send(.authResult, AuthResult(status: st, message: msg).encode())
             secure.close()
             return AuthError.rejected(st, msg)
@@ -361,6 +390,8 @@ public final class HostGatekeeper {
 
         // 新しい端末の登録は、ホストの画面で必ず許可を得る (無効にできない)。
         // 登録済み端末の接続ごとの確認は任意 (--confirm)。
+        // ここから先は (画面での確認を待つことがあるので) 期限を外す
+        deadline.disarm()
         if let ask = consent ?? (isNew ? newDeviceConsent : nil) {
             tcp.setReceiveTimeout(0)
             guard ask(name, fp, peer, isNew) else {
@@ -465,7 +496,20 @@ public enum ViewerConnector {
         tcp.setReceiveTimeout(20)
         let secure: SecureStream
         do {
-            secure = try SecureStream.connect(tcp, identity: identity)
+            // ホストの鍵は、こちらの鍵を送る前 (Noise の 2 通目を受けた時点) に確かめる。
+            // なりすましのホストに、この端末の公開鍵 (識別に使える) を渡さないため
+            secure = try SecureStream.connect(tcp, identity: identity) { hostKey in
+                let fp = Fingerprint.display(hostKey)
+                if let expected = expectedHostKey {
+                    guard expected == hostKey else { throw AuthError.hostKeyMismatch(actual: fp) }
+                } else if knownHosts.find(publicKey: hostKey) != nil {
+                    return
+                } else if let code = pairingCode {
+                    guard code.matches(hostPublicKey: hostKey) else { throw AuthError.hostKeyMismatch(actual: fp) }
+                } else {
+                    throw AuthError.unknownHost(fingerprint: fp)
+                }
+            }
         } catch {
             tcp.close()
             throw error
@@ -515,5 +559,28 @@ public enum ViewerConnector {
         }
         return Session(channel: MessageChannel(secure), hostPublicKey: hostKey, hostFingerprint: fp,
                        newlyPaired: proof != nil, isPostQuantum: secure.isPostQuantum)
+    }
+}
+
+
+/// 認証の手続き全体の期限。過ぎたら接続を閉じる (受信で待っているスレッドはエラーで戻る)
+final class AuthDeadline {
+    private let lock = NSLock()
+    private var armed = true
+    private(set) var fired = false
+
+    init(_ t: Transport, after seconds: TimeInterval) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let fire = self.armed
+            if fire { self.fired = true; self.armed = false }
+            self.lock.unlock()
+            if fire { t.close() }
+        }
+    }
+
+    func disarm() {
+        lock.lock(); armed = false; lock.unlock()
     }
 }

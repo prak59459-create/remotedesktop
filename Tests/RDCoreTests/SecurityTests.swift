@@ -534,6 +534,90 @@ final class SecurityTests: XCTestCase {
         HTTPRelayFrameFuzz.run(Array(0 ..< 255))
     }
 
+    /// 回帰テスト: 1 回ごとの受信タイムアウトより短い間隔で 1 バイトずつ送り続ける接続も、
+    /// 認証の手続き全体の期限で切られ、失敗として数えられる (認証前の枠を占有し続けられない)
+    func testSlowHandshakeIsCutOffByOverallDeadline() throws {
+        let env = try startHost()   // handshakeTimeout = 3 秒 → 全体の期限は 4.5 秒
+        let c = try TCPConnection.open(host: "127.0.0.1", port: env.port)
+        let start = Date()
+        var closedAt: Date?
+        // Noise の最初のメッセージの長さ (96 バイト) を送り、本体を 1 バイトずつ、1 秒おきに送る
+        try c.sendAll([0x00, 0x60])
+        for _ in 0 ..< 12 {
+            do {
+                try c.sendAll([0x00])
+            } catch {
+                closedAt = Date()
+                break
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        if closedAt == nil {
+            // 送信はバッファに入るだけで失敗しないこともあるので、受信で切断を確かめる
+            c.setReceiveTimeout(2)
+            _ = try? c.receive(exactly: 1)
+            closedAt = Date()
+        }
+        let elapsed = closedAt!.timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 9, "全体の期限 (4.5 秒) を大きく過ぎても切られなかった")
+        // 失敗として数えられている (ブロックまではされなくても記録はある)
+        Thread.sleep(forTimeInterval: 0.2)
+        env.gate.limiter.recordSuccess("127.0.0.1")
+    }
+
+    /// ビューアは、ホストの鍵が違えば自分の公開鍵 (Noise の 3 通目) を送らずに中止する
+    func testViewerDoesNotRevealItsKeyToAnImpostorHost() throws {
+        let listener = try TCPListener(port: 0, bindAddress: "127.0.0.1")
+        let impostor = StaticIdentity.generate()
+        let hostSaw = expectation(description: "ホスト側の結果")
+        var hostError: Error?
+        Thread {
+            defer { listener.close() }
+            guard let c = try? listener.accept() else { return }
+            c.setReceiveTimeout(5)
+            do {
+                _ = try SecureStream.accept(c, identity: impostor)
+            } catch {
+                hostError = error
+            }
+            hostSaw.fulfill()
+        }.start()
+
+        let viewer = StaticIdentity.generate()
+        let known = TrustStore.inMemoryForTesting()
+        let realHostKey = StaticIdentity.generate().publicKey
+        XCTAssertThrowsError(try ViewerConnector.connect(
+            transport: try TCPConnection.open(host: "127.0.0.1", port: listener.boundPort), label: "t",
+            identity: viewer, knownHosts: known, expectedHostKey: realHostKey, pairingCode: nil, deviceName: "v")) { e in
+            guard case AuthError.hostKeyMismatch = e else { return XCTFail("\(e)") }
+        }
+        wait(for: [hostSaw], timeout: 8)
+        // ホストは 3 通目 (ビューアの公開鍵を含む) を受け取れずに終わる
+        XCTAssertNotNil(hostError)
+    }
+
+    /// 回帰テスト: 署名済みの古い一覧に差し戻して、取り消した端末を復活させることはできない
+    func testTrustStoreRollbackIsDetected() throws {
+        let key = [UInt8](repeating: 5, count: 32)
+        let store = try TrustStore(fileName: "authorized_devices.json", integrityKey: key)
+        let device = StaticIdentity.generate()
+        try store.add(publicKey: device.publicKey, name: "stolen")
+        let url = try DataDirectory.url().appendingPathComponent("authorized_devices.json")
+        let snapshot = try XCTUnwrap(SecureFile.read(url)) // 取り消す前の、正しく署名されたファイル
+        XCTAssertEqual(try store.remove(matching: Fingerprint.display(device.publicKey)), 1)
+
+        try SecureFile.write(snapshot, to: url) // 差し戻す
+        let reopened = try TrustStore(fileName: "authorized_devices.json", integrityKey: key)
+        XCTAssertTrue(reopened.isTampered)
+        XCTAssertNil(reopened.find(publicKey: device.publicKey))
+        // ファイルごと消しても、番号が残っているので改ざんとして扱う (空の一覧として受け入れない)
+        try FileManager.default.removeItem(at: url)
+        XCTAssertTrue(try TrustStore(fileName: "authorized_devices.json", integrityKey: key).isTampered)
+        // 復旧 (--reset-devices) すれば、また使える
+        try reopened.reset()
+        XCTAssertFalse(try TrustStore(fileName: "authorized_devices.json", integrityKey: key).isTampered)
+    }
+
     func testPairingIsLANOnlyByDefault() {
         XCTAssertTrue(isPrivateIPv4("192.168.1.20"))
         XCTAssertTrue(isPrivateIPv4("10.0.0.1"))

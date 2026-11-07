@@ -48,13 +48,24 @@ const config = {
   trustProxy: process.env.TRUST_PROXY === '1', // Render などのリバースプロキシ配下なら 1
   maxMessage: 70 * 1024, // Noise のレコード (最大 65537 バイト) + 余裕
   maxRooms: Number(process.env.MAX_ROOMS || 500),
-  maxSessions: Number(process.env.MAX_SESSIONS || 200),
+  // 同時セッション数。相手が受け取れないまま溜められる量 (maxBuffered) との積がメモリの上限の目安になる
+  maxSessions: Number(process.env.MAX_SESSIONS || 32),
   maxPendingPerRoom: 4,
   maxConnsPerIP: 16,
   maxNewConnsPerMinute: 60,
   pendingTimeoutMs: 15000,
   pendingBufferLimit: 256 * 1024,
-  maxBuffered: 16 * 1024 * 1024, // 相手が受け取れないまま溜まったら切る (メモリ保護)
+  maxBuffered: 8 * 1024 * 1024, // 相手が受け取れないまま溜まったら切る (メモリ保護)
+  // サーバー全体で、HTTP の通り道で溜めておけるデータの合計 (無料プランのメモリを守る)
+  maxTotalQueued: Number(process.env.MAX_TOTAL_QUEUED || 96 * 1024 * 1024),
+  // サーバー全体の帯域 (全部屋の合計)。部屋ごとの上限だけだと、部屋を増やせば無料枠を使い切れてしまう
+  totalBytesPerSecond: Number(process.env.TOTAL_BYTES_PER_SECOND || 16 * 1024 * 1024),
+  totalBurstBytes: Number(process.env.TOTAL_BURST_BYTES || 128 * 1024 * 1024),
+  // 1 日 (UTC) に中継してよい合計バイト数。0 なら無制限 (例: 月 5GB の無料枠なら 150000000 程度)
+  dailyBytesLimit: Number(process.env.DAILY_BYTES_LIMIT || 0),
+  // 使える部屋をこれだけに限る (カンマ区切り)。空なら制限なし。
+  // 個人用の中継サーバーなら、自分の部屋 ID だけを入れておくと、他人がホストを登録して枠を埋めることができない
+  allowedRooms: new Set((process.env.ALLOWED_ROOMS || '').split(',').map((r) => r.trim()).filter(Boolean)),
   heartbeatMs: 30000,
   hostAuthTimeoutMs: 5000,
   // 部屋ごとの帯域 (双方向合計)。無料枠の使い潰し対策。既定 8 MB/s、瞬間的には 64 MB まで
@@ -104,7 +115,21 @@ function tokenMatches(token, room) {
     crypto.timingSafeEqual(Buffer.from(roomFromToken(token)), Buffer.from(room));
 }
 
-const stats = { hostAuthFail: 0, rateLimited: 0, bandwidthKilled: 0, sessions: 0, httpSessions: 0 };
+const stats = { hostAuthFail: 0, rateLimited: 0, bandwidthKilled: 0, sessions: 0, httpSessions: 0, roomNotAllowed: 0, memoryKilled: 0 };
+
+/** サーバー全体の帯域・日ごとの量・メモリ */
+const totals = {
+  tokens: config.totalBurstBytes,
+  last: Date.now(),
+  day: new Date().toISOString().slice(0, 10),
+  dayBytes: 0,
+  queued: 0, // HTTP の通り道で溜めているバイト数の合計
+};
+
+/** 部屋が使えるか (ALLOWED_ROOMS) */
+function roomAllowed(room) {
+  return config.allowedRooms.size === 0 || config.allowedRooms.has(room);
+}
 
 const ROOM_RE = /^[0-9A-Z]{26}$/;
 const ID_RE = /^[0-9a-f]{32}$/;
@@ -144,14 +169,20 @@ function admit(ip) {
   return true;
 }
 
+function connInc(ip) {
+  connsPerIP.set(ip, (connsPerIP.get(ip) || 0) + 1);
+}
+
+function connDec(ip) {
+  const n = (connsPerIP.get(ip) || 1) - 1;
+  if (n <= 0) connsPerIP.delete(ip);
+  else connsPerIP.set(ip, n);
+}
+
 /** 接続 (WebSocket か HTTP のセッション) を IP ごとに数える */
 function track(conn, ip) {
-  connsPerIP.set(ip, (connsPerIP.get(ip) || 0) + 1);
-  conn.once('close', () => {
-    const n = (connsPerIP.get(ip) || 1) - 1;
-    if (n <= 0) connsPerIP.delete(ip);
-    else connsPerIP.set(ip, n);
-  });
+  connInc(ip);
+  conn.once('close', () => connDec(ip));
 }
 
 // MARK: - セッションの片側 (leg)
@@ -224,9 +255,21 @@ class HTTPLeg extends EventEmitter {
 
   send(buf) {
     if (this.closed) return;
+    if (totals.queued + buf.length > config.maxTotalQueued) {
+      // サーバー全体のメモリを守る (このセッションを切る。相手側も pipe で閉じられる)
+      stats.memoryKilled++;
+      return this.close(1013, 'server busy');
+    }
     this.queue.push(buf);
     this.queued += buf.length;
+    totals.queued += buf.length;
     this.flush();
+  }
+
+  /** 溜めている分を n バイト減らす (全体の計数も) */
+  dequeued(n) {
+    this.queued -= n;
+    totals.queued = Math.max(0, totals.queued - n);
   }
 
   /** 溜まっているデータを、開いている下りの応答に流す */
@@ -239,7 +282,7 @@ class HTTPLeg extends EventEmitter {
         this.stream.write(b);
       }
       this.queue = [];
-      this.queued = 0;
+      this.dequeued(this.queued);
       if (this.closed) this.endStream();
     } else if (this.mode === 'poll' && this.poll && (this.queued > 0 || this.closed)) {
       const { res, timer } = this.poll;
@@ -270,7 +313,7 @@ class HTTPLeg extends EventEmitter {
       parts.push(b);
       size = b.length;
     }
-    this.queued -= size;
+    this.dequeued(size);
     this.lastBody = Buffer.concat(parts, size);
     res.writeHead(200, {
       'content-type': 'application/octet-stream',
@@ -290,17 +333,20 @@ class HTTPLeg extends EventEmitter {
   close() {
     if (this.closed) return;
     this.closed = true;
-    if (this.mode === 'stream') {
-      // 確認前なら溜まっている分は届けようがない
-      if (this.ready) this.flush();
-      this.endStream();
-      httpLegs.delete(this.id);
-    } else if (this.poll) {
-      this.flush();
-    } else if (this.queued === 0) {
-      httpLegs.delete(this.id);
+    if (this.mode === 'stream' && this.ready) {
+      this.flush(); // 送り出すだけ (保持はしない)
     }
-    // poll で未送信のデータが残っている場合は、次の /h/recv で渡してから消す (掃除で最長 legIdleMs)
+    // 届けられなかった分はすぐ捨てる (閉じた接続にメモリを持たせ続けない)
+    this.queue = [];
+    this.dequeued(this.queued);
+    this.endStream();
+    if (this.poll) {
+      const { res, timer } = this.poll;
+      clearTimeout(timer);
+      this.poll = null;
+      empty(res, 410);
+    }
+    httpLegs.delete(this.id);
     this.emit('close');
   }
 
@@ -321,13 +367,23 @@ function closeBoth(a, b, code, reason) {
   }
 }
 
-/** 部屋の帯域を消費する。足りなければ false */
+/** 部屋とサーバー全体の帯域を消費する。足りなければ false */
 function spend(state, n) {
   const now = Date.now();
   state.tokens = Math.min(config.roomBurstBytes, state.tokens + ((now - state.last) / 1000) * config.roomBytesPerSecond);
   state.last = now;
-  if (state.tokens < n) return false;
+  totals.tokens = Math.min(config.totalBurstBytes, totals.tokens + ((now - totals.last) / 1000) * config.totalBytesPerSecond);
+  totals.last = now;
+  const today = new Date(now).toISOString().slice(0, 10);
+  if (today !== totals.day) {
+    totals.day = today;
+    totals.dayBytes = 0;
+  }
+  if (config.dailyBytesLimit > 0 && totals.dayBytes + n > config.dailyBytesLimit) return false;
+  if (state.tokens < n || totals.tokens < n) return false;
   state.tokens -= n;
+  totals.tokens -= n;
+  totals.dayBytes += n;
   return true;
 }
 
@@ -366,8 +422,10 @@ class WSHost {
 }
 
 class HTTPHost {
-  constructor(hid) {
+  constructor(hid, ip) {
     this.hid = hid;
+    this.ip = ip;
+    this.counted = false; // IP ごとの接続数に数えたか
     this.events = [];
     this.poll = null; // { res, timer }
     this.lastPoll = Date.now();
@@ -410,15 +468,29 @@ function registerHost(room, host) {
   }
   if (!existing && rooms.size >= config.maxRooms) return { code: 4029, status: 429, reason: 'server full' };
   if (existing && existing.host.same(host)) return null; // HTTP のホストの 2 回目以降のポーリング
+  if (existing && existing.host instanceof HTTPHost) releaseHost(existing.host); // 死んだ HTTP のホストの分を戻す
   const state = existing || { host, pending: new Map(), tokens: config.roomBurstBytes, last: Date.now() };
   state.host = host;
+  if (host instanceof HTTPHost && !host.counted) {
+    // HTTP のホストも、IP ごとの同時接続数に数える (WebSocket のホストは track で数えている)
+    host.counted = true;
+    connInc(host.ip);
+  }
   rooms.set(room, state);
   log('host up', room.slice(0, 4) + '…', host instanceof HTTPHost ? '(http)' : '(ws)');
   return null;
 }
 
+function releaseHost(host) {
+  if (host.counted) {
+    host.counted = false;
+    connDec(host.ip);
+  }
+}
+
 /** ホストが落ちた。部屋を消して、待っているビューアを切る */
 function hostDown(room, host) {
+  if (host instanceof HTTPHost) releaseHost(host);
   const s = rooms.get(room);
   if (!s || s.host !== host) return;
   for (const p of s.pending.values()) {
@@ -600,7 +672,11 @@ async function httpHost(req, res, room, ip) {
     stats.hostAuthFail++;
     return empty(res, 403);
   }
-  const host = known ? st.host : new HTTPHost(msg.hid);
+  if (!known && (connsPerIP.get(ip) || 0) >= config.maxConnsPerIP) {
+    stats.rateLimited++;
+    return empty(res, 429);
+  }
+  const host = known ? st.host : new HTTPHost(msg.hid, ip);
   const err = registerHost(room, host);
   if (err) return empty(res, err.status);
   if (!known) {
@@ -744,6 +820,10 @@ async function handleHTTP(req, res, url) {
   if (kind === '/h/host' || kind === '/h/connect' || kind === '/h/accept') {
     const room = q.get('room') || '';
     if (!ROOM_RE.test(room)) return empty(res, 400);
+    if (!roomAllowed(room)) {
+      stats.roomNotAllowed++;
+      return empty(res, 404);
+    }
     if (kind === '/h/host') return httpHost(req, res, room, ip);
     if (kind === '/h/connect') {
       if (!admit(ip)) {
@@ -833,6 +913,11 @@ server.on('upgrade', (req, socket, head) => {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
+  if (!roomAllowed(room)) {
+    stats.roomNotAllowed++;
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    return socket.destroy();
+  }
   if (kind === '/accept') {
     // ホストへの通知に載せた推測不能な ID を持つ場合だけ。IP 制限の対象外 (ホストのセッション数で詰まらないように)
     const st = rooms.get(room);
@@ -896,7 +981,7 @@ keepalive.unref();
 
 // 異常の兆候 (トークン不一致・レート制限・帯域超過) を定期的に記録
 const statsTimer = setInterval(() => {
-  log('stats', JSON.stringify({ rooms: rooms.size, active: activeSessions, ...stats }));
+  log('stats', JSON.stringify({ rooms: rooms.size, active: activeSessions, queued: totals.queued, today: totals.dayBytes, ...stats }));
 }, config.statsIntervalMs);
 statsTimer.unref();
 
@@ -907,4 +992,4 @@ if (require.main === module) {
   server.listen(config.port, () => log('relay listening on', config.port));
 }
 
-module.exports = { server, config, rooms, httpLegs, roomFromToken, base32 };
+module.exports = { server, wss, config, rooms, httpLegs, totals, connsPerIP, roomFromToken, base32 };

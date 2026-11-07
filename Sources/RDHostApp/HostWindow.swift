@@ -24,14 +24,14 @@ private enum Palette {
 }
 
 private enum ID {
-    static let startStop = 100, pair = 101, copyCode = 102, copyEndpoint = 103
+    static let startStop = 100, pair = 101, copyCode = 102, copyEndpoint = 103, disconnect = 104
     static let devices = 200, revoke = 201, resetDevices = 202
     static let relayURL = 300, transport = 301, direct = 302, port = 303, bonjour = 304, confirm = 305
     static let onDisconnect = 306, idle = 307, fps = 308, scale = 309, kbps = 310, pq = 311
     static let autoStart = 312, tray = 313, login = 314, save = 320
     static let log = 400, verifyLog = 401, openFolder = 402
     // タスクトレイのメニュー
-    static let trayOpen = 1001, trayPair = 1002, trayStartStop = 1003, trayQuit = 1004
+    static let trayOpen = 1001, trayPair = 1002, trayStartStop = 1003, trayQuit = 1004, trayDisconnect = 1005
 }
 
 private enum ButtonKind { case primary, secondary, danger }
@@ -39,6 +39,8 @@ private enum ButtonKind { case primary, secondary, danger }
 final class HostWindow {
     let service: HostService
     var settings: HostSettings
+    /// 設定ファイルの署名の鍵
+    var settingsKey: [UInt8] = []
     private(set) var hwnd: HWND?
     private let scale: Double
     private var page = 0
@@ -208,6 +210,7 @@ final class HostWindow {
         button("ペアリングコードを表示", R(right, 326, 190, 42), id: ID.pair, page: 0, kind: .primary, on: Palette.card)
         button("コードをコピー", R(right, 378, 190, 36), id: ID.copyCode, page: 0, kind: .secondary, on: Palette.card)
         button("接続先をコピー", R(right, 180, 190, 36), id: ID.copyEndpoint, page: 0, kind: .secondary, on: Palette.card)
+        button("すべて切断", R(right, 494, 190, 38), id: ID.disconnect, page: 0, kind: .danger, on: Palette.card)
         // 端末
         add("LISTBOX", "", Style.lbsNotify | Style.lbsOwnerDrawFixed | Style.lbsNoIntegralHeight | Style.vScroll,
             R(cx + 20, 184, cw - 40, 392), id: ID.devices, page: 1)
@@ -307,6 +310,7 @@ final class HostWindow {
         for (id, h) in controls {
             let visible = pageOf[id] == p && (id != ID.copyCode || service.pairing != nil)
                 && (id != ID.copyEndpoint || service.directEndpoint != nil)
+                && (id != ID.disconnect || !service.sessions.isEmpty)
             _ = ShowWindow(h, visible ? 5 : 0)
         }
         if p == 1 { reloadDevices() }
@@ -332,7 +336,19 @@ final class HostWindow {
     }
 
     private func toggleService() {
-        if service.isRunning { service.stop() } else { startService() }
+        if service.isRunning {
+            // 「停止」は、待ち受けだけでなく接続中のセッションも終わらせる
+            service.stop(disconnectSessions: true)
+        } else {
+            startService()
+        }
+        refresh()
+    }
+
+    private func disconnectAll() {
+        guard !service.sessions.isEmpty else { return }
+        service.disconnectAll()
+        flash("接続中の端末を切断しました")
         refresh()
     }
 
@@ -355,7 +371,7 @@ final class HostWindow {
             return
         }
         do {
-            try s.save()
+            try s.save(key: settingsKey)
         } catch {
             alert("設定を保存できませんでした", "\(error)", warning: true)
             return
@@ -446,6 +462,7 @@ final class HostWindow {
         if page == 0 {
             if let h = ctl(ID.copyCode) { _ = ShowWindow(h, service.pairing != nil ? 5 : 0) }
             if let h = ctl(ID.copyEndpoint) { _ = ShowWindow(h, service.directEndpoint != nil ? 5 : 0) }
+            if let h = ctl(ID.disconnect) { _ = ShowWindow(h, service.sessions.isEmpty ? 0 : 5) }
         }
         if let h = ctl(ID.startStop) { _ = InvalidateRect(h, nil, false) }
         // 新しく接続した端末を知らせる
@@ -517,7 +534,8 @@ final class HostWindow {
         }
         item(ID.trayOpen, "開く")
         item(ID.trayPair, "新しい端末を登録 (ペアリングコード)")
-        item(ID.trayStartStop, service.isRunning ? "待ち受けを停止" : "待ち受けを開始")
+        item(ID.trayStartStop, service.isRunning ? "待ち受けを停止 (接続中も切断)" : "待ち受けを開始")
+        if !service.sessions.isEmpty { item(ID.trayDisconnect, "接続中の端末をすべて切断") }
         _ = AppendMenuW(menu, 0x800 /* MF_SEPARATOR */, 0, nil)
         item(ID.trayQuit, "終了")
         var pt = POINT()
@@ -554,6 +572,7 @@ final class HostWindow {
                 copyToClipboard(e, owner: hwnd)
                 flash("接続先 (\(e)) をコピーしました")
             }
+        case ID.disconnect, ID.trayDisconnect: disconnectAll()
         case ID.revoke: revokeSelected()
         case ID.resetDevices: resetDevices()
         case ID.save: save()
@@ -967,7 +986,14 @@ func runApp() {
         fail("Remote Desktop ホスト", problem)
         return
     }
-    let settings = HostSettings.load()
+    let settingsKey: [UInt8]
+    do {
+        settingsKey = try HostSettings.integrityKey()
+    } catch {
+        fail("Remote Desktop ホスト", "鍵を読み込めません: \(error)")
+        return
+    }
+    let (settings, settingsProblem) = HostSettings.load(key: settingsKey)
     RelayTransportMode.default = RelayTransportMode(rawValue: settings.relayTransport) ?? .auto
     let service: HostService
     do {
@@ -977,7 +1003,21 @@ func runApp() {
         return
     }
     let window = HostWindow(service: service, settings: settings)
+    window.settingsKey = settingsKey
     window.create(show: screenshotDir != nil || !args.contains("--minimized"))
+    if let problem = settingsProblem, screenshotDir == nil {
+        // 署名のない・合わない設定は使わず、既定値で動かす (中継は使わない・確認なし・直接接続のみ)
+        switch problem {
+        case .tampered:
+            AuditLogNotice.record("HOST_SETTINGS_TAMPERED action=use_defaults")
+            fail("Remote Desktop ホスト — 設定ファイルの確認",
+                 "設定ファイル (host_settings.json) がこのアプリ以外で書き換えられています。安全のため既定の設定で起動しました。\n心当たりがなければ PC の安全を確認し、設定画面で設定し直して保存してください。")
+        case .unsigned:
+            AuditLogNotice.record("HOST_SETTINGS_UNSIGNED action=use_defaults")
+            fail("Remote Desktop ホスト — 設定の確認",
+                 "設定ファイルが古い形式 (署名なし) のため、既定の設定で起動しました。\n設定画面で中継サーバーなどを確認して「保存」すると、署名付きで保存し直されます。")
+        }
+    }
     if let dir = screenshotDir {
         _ = service.startPairing() // コードの表示も確認する
         window.refresh()
@@ -1002,5 +1042,12 @@ func relativeTime(_ d: Date) -> String {
     if s < 3600 { return "\(s / 60) 分前" }
     if s < 86400 { return "\(s / 3600) 時間前" }
     return "\(s / 86400) 日前"
+}
+#endif
+
+#if os(Windows)
+/// 起動時の注意を監査ログに残す
+enum AuditLogNotice {
+    static func record(_ line: String) { AuditLog().record(line) }
 }
 #endif

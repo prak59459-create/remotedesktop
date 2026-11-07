@@ -39,13 +39,16 @@ func usage() -> Never {
       --list            登録済みの端末を表示
       --revoke ID       端末の登録を取り消す (ID は --list の指紋の先頭 4 文字以上)
       --fingerprint     このホストの指紋を表示
+      --relay-room      中継サーバー上の部屋 ID を表示 (中継サーバーの ALLOWED_ROOMS に設定する値)
+      --new-relay-room  部屋 ID を作り直す (なくした端末を取り消したあとに。ほかの端末は
+                        次に同じ Wi-Fi で 1 回接続するまで、中継経由では接続できなくなる)
       --reset-devices   登録済み端末をすべて消す (一覧の改ざんを検知したときの復旧用)
       --verify-log      監査ログのハッシュチェーンを検証する
     """)
     exit(0)
 }
 
-enum Command: Equatable { case serve, list, revoke(String), fingerprint, resetDevices, verifyLog }
+enum Command: Equatable { case serve, list, revoke(String), fingerprint, resetDevices, verifyLog, relayRoom, newRelayRoom }
 
 var options = HostOptions()
 var command = Command.serve
@@ -89,6 +92,8 @@ while let a = args.next() {
     case "--list": command = .list
     case "--revoke": command = .revoke(args.next() ?? "")
     case "--fingerprint": command = .fingerprint
+    case "--relay-room": command = .relayRoom
+    case "--new-relay-room": command = .newRelayRoom
     case "--data-dir": DataDirectory.overridePath = args.next()
     case "-h", "--help": usage()
     default:
@@ -122,6 +127,20 @@ if service.isTampered && command != .resetDevices {
 }
 
 switch command {
+case .relayRoom:
+    print(service.relayRoomID)
+    exit(0)
+case .newRelayRoom:
+    do {
+        try service.rotateRelayRoom()
+        print("部屋 ID を作り直しました: \(service.relayRoomID)")
+        print("ほかの端末は、次に同じ Wi-Fi で 1 回接続すると、新しい部屋 ID を受け取って中継経由でも使えるようになります。")
+        print("中継サーバーで ALLOWED_ROOMS を使っている場合は、新しい部屋 ID に書き換えてください。")
+        exit(0)
+    } catch {
+        print("エラー: \(error)")
+        exit(1)
+    }
 case .fingerprint:
     print(service.fingerprint)
     exit(0)

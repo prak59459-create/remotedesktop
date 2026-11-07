@@ -13,3 +13,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # relay/Dockerfile の node イメージ (digest で固定しているので、更新はこの PR で)
+  - package-ecosystem: docker
+    directory: /relay
+    schedule:
+      interval: weekly
