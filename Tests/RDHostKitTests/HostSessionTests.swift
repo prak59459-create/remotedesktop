@@ -70,7 +70,7 @@ final class HostSessionTests: XCTestCase {
                 if s { return }
                 try? session.channel.send(.requestKeyframe)
                 try? session.channel.send(.frameAck)
-                usleep(2000)
+                Thread.sleep(forTimeInterval: 0.002)
             }
         }.start()
         defer { stop.lock(); stopped = true; stop.unlock(); session.channel.close() }
@@ -106,7 +106,7 @@ final class HostSessionTests: XCTestCase {
                 if s { return }
                 try? session.channel.send(.requestKeyframe)
                 try? session.channel.send(.frameAck)
-                usleep(2000)
+                Thread.sleep(forTimeInterval: 0.002)
             }
         }.start()
         defer { stop.lock(); stopped = true; stop.unlock(); session.channel.close() }
