@@ -29,6 +29,8 @@ SwiftPM で作ったリモートデスクトップです。**iPad（または Ma
 
 [Render](https://render.com) の無料プランで動かします。このリポジトリの `render.yaml`（Blueprint）からデプロイすると `https://<名前>.onrender.com` が中継サーバーの URL になります。
 
+**おすすめ:** Windows で `RDHost.exe --relay-room` を実行して表示された部屋 ID を、Render の環境変数 `ALLOWED_ROOMS` に入れてください。他人が同じ中継サーバーにホストを登録して枠を埋めることができなくなります。1 日の転送量の上限は `DAILY_BYTES_LIMIT`（バイト）で設定できます。
+
 ### 2. Windows 側 (RemoteDesktopHost.exe / RDHost.exe)
 
 **GUI 版 `RemoteDesktopHost.exe`（おすすめ）** をダブルクリックで起動します。
@@ -82,6 +84,7 @@ RDHost.exe --relay https://<名前>.onrender.com --confirm
 | `--bind ADDR` / `--port N` / `--fps N` / `--scale N` | 待ち受けアドレス、ポート、最大フレームレート、縮小率 |
 | `--max-kbps N` | 画面データの送信量の上限（kbps、既定は無制限）。無料の中継サーバーの月間転送量を守りたいとき（例: `500`） |
 | `--list` / `--revoke ID` / `--fingerprint` | 登録済み端末の一覧 / 取り消し / ホストの指紋 |
+| `--relay-room` / `--new-relay-room` | 中継サーバー上の部屋 ID の表示（`ALLOWED_ROOMS` 用）/ 作り直し（端末をなくしたとき。ほかの端末は次に同じ Wi-Fi で 1 回つなぐまで中継で使えない） |
 | `--verify-log` / `--reset-devices` | 監査ログの改ざん検証 / 登録端末をすべて消去（一覧の改ざんを検知したとき） |
 | `--allow-remote-pairing` | LAN 外からの端末登録も許可（非推奨） |
 

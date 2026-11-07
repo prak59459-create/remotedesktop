@@ -41,5 +41,7 @@ nginx など別のリバースプロキシを使う場合は、WebSocket の upg
 ## 運用
 
 - `docker logs rd-relay` に 10 分ごとの統計（トークン不一致・レート制限・帯域超過の回数）が出ます。急に増えたら攻撃の兆候です。
-- 帯域の上限は環境変数 `ROOM_BYTES_PER_SECOND`（既定 8 MB/s）と `ROOM_BURST_BYTES` で変えられます。
+- 帯域の上限は環境変数 `ROOM_BYTES_PER_SECOND`（既定 8 MB/s）と `ROOM_BURST_BYTES` で変えられます。サーバー全体の上限は `TOTAL_BYTES_PER_SECOND`（既定 16 MB/s）、1 日の上限は `DAILY_BYTES_LIMIT`（既定は無制限。月 5GB の無料枠なら `150000000` 程度）です。
+- **個人用なら `ALLOWED_ROOMS` を設定してください。** Windows で `RDHost.exe --relay-room` を実行すると部屋 ID が表示されるので、それを入れます（複数ならカンマ区切り）。他人がホストを登録して枠を埋めることができなくなります。`RDHost.exe --new-relay-room` で部屋 ID を作り直したときは、ここも書き換えてください。
+- 溜めておけるデータの合計は `MAX_TOTAL_QUEUED`（既定 96 MB）、同時セッション数は `MAX_SESSIONS`（既定 32）です。
 - `npm audit` と Dependabot の更新を取り込んだら、イメージを作り直してください。
