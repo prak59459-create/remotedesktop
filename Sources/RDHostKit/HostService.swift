@@ -30,7 +30,7 @@ public final class HostService {
 
     private let identity: StaticIdentity
     private let clients: TrustStore
-    private let roomToken: [UInt8]
+    private var roomToken: [UInt8]
     private let audit: AuditLog
     private let gate: HostGatekeeper
     private let consentGate = ConsentGate()
@@ -116,6 +116,22 @@ public final class HostService {
         try clients.reset()
         audit.record("DEVICES_RESET")
         onChange?()
+    }
+
+    /// 中継サーバー上の部屋 ID (中継サーバーの ALLOWED_ROOMS に入れる値)
+    public var relayRoomID: String { locked { RelayRoom.id(token: roomToken) } }
+
+    /// 部屋のトークンを作り直す (端末を取り消したあと、その端末が部屋 ID を使って中継で接続を試みられないように)。
+    /// ほかの端末も、次に同じ Wi-Fi で 1 回接続するまで中継経由では接続できなくなる
+    public func rotateRelayRoom() throws {
+        var rng = SystemRandomNumberGenerator()
+        let fresh = (0 ..< 32).map { _ in UInt8.random(in: 0 ... 255, using: &rng) }
+        try SecretStore.save(name: "relay_room_token", bytes: fresh)
+        let wasRunning = isRunning
+        if wasRunning { stop() }
+        lock.lock(); roomToken = fresh; lock.unlock()
+        audit.record("RELAY_ROOM_ROTATED")
+        if wasRunning { try start() }
     }
 
     /// 新しい端末を登録するためのコードを出す (10 分間・1 回限り)
@@ -229,8 +245,16 @@ public final class HostService {
         onChange?()
     }
 
-    /// 待ち受けをやめる (接続中のセッションはそのまま)
-    public func stop() {
+    /// 接続中のセッションをすべてホスト側から切る
+    public func disconnectAll() {
+        let n = sessions.count
+        ActiveSessions.shared.disconnectAll(reason: "host_disconnected")
+        if n > 0 { hostLog("接続中の \(n) 台を切断しました") }
+    }
+
+    /// 待ち受けをやめる。disconnectSessions なら接続中のセッションも切る
+    public func stop(disconnectSessions: Bool = false) {
+        if disconnectSessions { disconnectAll() }
         lock.lock()
         let l = listener, r = relayListener
         listener = nil
@@ -347,18 +371,54 @@ public struct HostSettings: Codable, Equatable {
 
     static let fileName = "host_settings.json"
 
-    public static func load() -> HostSettings {
-        guard let url = try? DataDirectory.url().appendingPathComponent(fileName),
-              let data = try? Data(contentsOf: url),
-              let s = try? JSONDecoder().decode(HostSettings.self, from: data) else { return HostSettings() }
-        return s
+    /// 署名付きの保存形式。中継先の URL や「接続のたびに確認」を、ファイルを書き換えるだけで変えられないように
+    private struct Signed: Codable {
+        var settings: String // HostSettings の JSON そのもの (署名対象)
+        var mac: String
     }
 
-    public func save() throws {
+    /// 設定ファイルの署名に使う鍵 (ホストの秘密鍵から導出。許可端末の一覧と同じ考え方)
+    public static func integrityKey() throws -> [UInt8] {
+        let id = try SecretStore.loadOrCreateIdentity(name: "host_identity")
+        return noiseHMAC(key: id.rawPrivateKey, Array("RemoteDesktop host settings key v1".utf8))
+    }
+
+    private static func mac(_ body: [UInt8], key: [UInt8]) -> [UInt8] {
+        noiseHMAC(key: key, Array("RemoteDesktop host settings v1".utf8) + body)
+    }
+
+    public enum LoadProblem: Equatable {
+        /// 署名のない古い形式 (以前の版で保存したもの)。署名がないので中身は使わない
+        case unsigned
+        /// 署名が合わない (このアプリ以外で書き換えられた)
+        case tampered
+    }
+
+    /// 読み込む。署名が合わなければ既定値 (安全側) を返す
+    public static func load(key: [UInt8]) -> (settings: HostSettings, problem: LoadProblem?) {
+        guard let url = try? DataDirectory.url().appendingPathComponent(fileName),
+              let data = try? Data(contentsOf: url) else { return (HostSettings(), nil) }
+        guard let signed = try? JSONDecoder().decode(Signed.self, from: data) else {
+            let legacy = (try? JSONDecoder().decode(HostSettings.self, from: data)) != nil
+            return (HostSettings(), legacy ? .unsigned : .tampered)
+        }
+        guard let given = Fingerprint.fromHex(signed.mac),
+              constantTimeEqual(given, mac(Array(signed.settings.utf8), key: key)),
+              let s = try? JSONDecoder().decode(HostSettings.self, from: Data(signed.settings.utf8)) else {
+            return (HostSettings(), .tampered)
+        }
+        return (s, nil)
+    }
+
+    public func save(key: [UInt8]) throws {
         let url = try DataDirectory.url().appendingPathComponent(Self.fileName)
         let enc = JSONEncoder()
+        enc.outputFormatting = [.sortedKeys]
+        let body = try enc.encode(self)
+        let signed = Signed(settings: String(decoding: body, as: UTF8.self),
+                            mac: Fingerprint.hex(Self.mac(Array(body), key: key)))
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try enc.encode(self).write(to: url, options: .atomic)
+        try SecureFile.write([UInt8](try enc.encode(signed)), to: url)
     }
 
     /// 入力の不備 (無ければ nil)

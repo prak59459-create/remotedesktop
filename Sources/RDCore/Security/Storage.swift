@@ -75,9 +75,9 @@ public enum DataDirectory {
 /// 本人だけが読めるファイルとして原子的に書き込む
 public enum SecureFile {
     public static func write(_ bytes: [UInt8], to url: URL) throws {
-        let tmp = url.appendingPathExtension("tmp")
+        // 一時ファイルの名前は毎回変える (別プロセスが同時に書いても、互いの途中のファイルを上書きしない)
+        let tmp = url.appendingPathExtension("\(UUID().uuidString).tmp")
         let fm = FileManager.default
-        try? fm.removeItem(at: tmp)
         #if os(Windows)
         guard fm.createFile(atPath: tmp.path, contents: Data(bytes)) else { throw StorageError.io("書き込み失敗: \(tmp.path)") }
         #else
@@ -101,6 +101,38 @@ public enum SecureFile {
     public static func read(_ url: URL) -> [UInt8]? {
         guard let d = FileManager.default.contents(atPath: url.path) else { return nil }
         return [UInt8](d)
+    }
+
+    /// 別プロセスとも排他して body を実行する (url + ".lock" をロックファイルにする)。
+    /// 読み直し → 変更 → 書き込みの間に、別プロセスの --revoke などが割り込まないように
+    public static func withLock<T>(_ url: URL, _ body: () throws -> T) rethrows -> T {
+        let path = url.path + ".lock"
+        #if os(Windows)
+        // 共有なしで開けた間だけロックを持つ (ほかのプロセスは開けるまで待つ。最長 5 秒)
+        var handle: HANDLE?
+        for _ in 0 ..< 250 {
+            let h: HANDLE? = path.withCString(encodedAs: UTF16.self) {
+                CreateFileW($0, DWORD(0x8000_0000 | 0x4000_0000), 0, nil, DWORD(4) /* OPEN_ALWAYS */, DWORD(0x80), nil)
+            }
+            if let h, Int(bitPattern: h) != -1 {
+                handle = h
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        defer { if let h = handle { CloseHandle(h) } }
+        return try body()
+        #else
+        let fd = open(path, O_RDWR | O_CREAT, 0o600)
+        if fd >= 0 { _ = flock(fd, LOCK_EX) }
+        defer {
+            if fd >= 0 {
+                _ = flock(fd, LOCK_UN)
+                close(fd)
+            }
+        }
+        return try body()
+        #endif
     }
 }
 
@@ -350,7 +382,13 @@ public final class TrustStore {
         var version: Int
         var entries: String // [Entry] の JSON そのもの (署名対象)
         var mac: String
+        /// 書き込むたびに増える番号 (署名対象)。最新の番号は別の場所 (SecretStore) にも持つ。
+        /// 署名済みの古いファイルに差し戻して、取り消した端末を復活させる攻撃を検知するため
+        var generation: Int?
     }
+
+    /// 最後に読んだ・書いた番号
+    private var generation = 0
 
     private let url: URL
     private let lock = NSLock()
@@ -364,9 +402,10 @@ public final class TrustStore {
     public init(fileName: String, integrityKey: [UInt8]? = nil) throws {
         url = try DataDirectory.url().appendingPathComponent(fileName)
         self.integrityKey = integrityKey
-        let (e, t) = Self.load(url, key: integrityKey)
+        let (e, t, g) = Self.load(url, key: integrityKey)
         entries = e
         isTampered = t
+        generation = g
     }
 
     /// ホストの秘密鍵から、許可一覧の改ざん検知用の鍵を導出する
@@ -380,8 +419,22 @@ public final class TrustStore {
         return d
     }
 
-    private static func mac(_ bytes: [UInt8], key: [UInt8]) -> [UInt8] {
-        noiseHMAC(key: key, Array("RemoteDesktop trust store v1".utf8) + bytes)
+    private static func mac(_ bytes: [UInt8], key: [UInt8], generation: Int? = nil) -> [UInt8] {
+        guard let g = generation else { return noiseHMAC(key: key, Array("RemoteDesktop trust store v1".utf8) + bytes) }
+        return noiseHMAC(key: key, Array("RemoteDesktop trust store v2 gen=\(g)\n".utf8) + bytes)
+    }
+
+    /// 最新の番号の保管場所 (Windows では DPAPI + TPM、macOS / iPadOS ではキーチェーン)
+    private static func generationName(_ url: URL) -> String { "trustgen." + url.lastPathComponent }
+
+    private static func storedGeneration(_ url: URL) -> Int? {
+        guard let b = try? SecretStore.load(name: generationName(url)), b.count == 8 else { return nil }
+        return Int(b.reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+    }
+
+    private static func storeGeneration(_ g: Int, _ url: URL) {
+        let v = UInt64(g)
+        try? SecretStore.save(name: generationName(url), bytes: (0 ..< 8).map { UInt8(truncatingIfNeeded: v >> (56 - 8 * UInt64($0))) })
     }
 
     /// iPad: 一覧の写しをキーチェーンにも置く。アプリを入れ直す (更新する) とサンドボックス内のファイルは消えるが、
@@ -396,29 +449,37 @@ public final class TrustStore {
         #endif
     }
 
-    private static func load(_ url: URL, key: [UInt8]?) -> ([Entry], Bool) {
+    private static func load(_ url: URL, key: [UInt8]?) -> ([Entry], Bool, Int) {
         var stored = SecureFile.read(url)
         if (stored ?? []).isEmpty && usesKeychainBackup,
            let backup = try? SecretStore.load(name: backupName(url)), !backup.isEmpty {
             stored = backup
             try? SecureFile.write(backup, to: url) // ファイルに戻しておく
         }
-        guard let data = stored, !data.isEmpty else { return ([], false) }
+        // 署名付きの一覧で、番号だけが残っていてファイルが無いのは、ファイルを消されたということ
+        guard let data = stored, !data.isEmpty else {
+            if key != nil, let g = storedGeneration(url), g > 0 { return ([], true, g) }
+            return ([], false, 0)
+        }
         if let signed = try? decoder().decode(Signed.self, from: Data(data)) {
             let body = Array(signed.entries.utf8)
             if let key = key {
                 guard let given = Fingerprint.fromHex(signed.mac),
-                      constantTimeEqual(given, mac(body, key: key)) else { return ([], true) }
+                      constantTimeEqual(given, mac(body, key: key, generation: signed.generation)) else {
+                    return ([], true, 0)
+                }
+                // 差し戻しの検知: ファイルの番号が、覚えている最新の番号より古ければ改ざん扱い
+                if let latest = storedGeneration(url), (signed.generation ?? 0) < latest { return ([], true, latest) }
             }
-            guard let e = try? decoder().decode([Entry].self, from: Data(body)) else { return ([], true) }
-            return (e, false)
+            guard let e = try? decoder().decode([Entry].self, from: Data(body)) else { return ([], true, 0) }
+            return (e, false, signed.generation ?? 0)
         }
         if let legacy = try? decoder().decode([Entry].self, from: Data(data)) {
             // 署名が必要なのに署名がない = 書き換えられた可能性
-            if key != nil { return ([], true) }
-            return (legacy, false)
+            if key != nil { return ([], true, 0) }
+            return (legacy, false, 0)
         }
-        return ([], key != nil)
+        return ([], key != nil, 0)
     }
 
     /// ディスクから読み直す (別プロセスでの --revoke を反映するため)
@@ -428,9 +489,10 @@ public final class TrustStore {
     }
 
     private func reloadLocked() {
-        let (fresh, t) = Self.load(url, key: integrityKey)
+        let (fresh, t, g) = Self.load(url, key: integrityKey)
         entries = fresh
         isTampered = t
+        generation = max(generation, g)
     }
 
     public var all: [Entry] {
@@ -446,59 +508,69 @@ public final class TrustStore {
     }
 
     public func add(publicKey: [UInt8], name: String, relayRoom: String? = nil) throws {
-        let hex = Fingerprint.hex(publicKey)
-        lock.lock(); defer { lock.unlock() }
-        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
-        guard !isTampered else { throw StoreError.tampered }
-        let old = entries.first { $0.publicKey == hex }
-        entries.removeAll { $0.publicKey == hex }
-        entries.append(Entry(publicKey: hex, name: name, added: old?.added ?? Date(), lastSeen: Date(),
-                             relayRoom: relayRoom ?? old?.relayRoom))
-        try persist()
+        return try SecureFile.withLock(url) {
+            let hex = Fingerprint.hex(publicKey)
+            lock.lock(); defer { lock.unlock() }
+            reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
+            guard !isTampered else { throw StoreError.tampered }
+            let old = entries.first { $0.publicKey == hex }
+            entries.removeAll { $0.publicKey == hex }
+            entries.append(Entry(publicKey: hex, name: name, added: old?.added ?? Date(), lastSeen: Date(),
+                                 relayRoom: relayRoom ?? old?.relayRoom))
+            try persist()
+        }
     }
 
     /// ビューア側: ホストから受け取った中継の部屋 ID を記録する
     public func setRelayRoom(publicKey: [UInt8], room: String) throws {
-        let hex = Fingerprint.hex(publicKey)
-        lock.lock(); defer { lock.unlock() }
-        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
-        guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
-        guard entries[i].relayRoom != room else { return }
-        entries[i].relayRoom = room
-        try persist()
+        return try SecureFile.withLock(url) {
+            let hex = Fingerprint.hex(publicKey)
+            lock.lock(); defer { lock.unlock() }
+            reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
+            guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
+            guard entries[i].relayRoom != room else { return }
+            entries[i].relayRoom = room
+            try persist()
+        }
     }
 
     public func touch(publicKey: [UInt8]) {
-        let hex = Fingerprint.hex(publicKey)
-        lock.lock(); defer { lock.unlock() }
-        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
-        guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
-        entries[i].lastSeen = Date()
-        try? persist()
+        SecureFile.withLock(url) {
+            let hex = Fingerprint.hex(publicKey)
+            lock.lock(); defer { lock.unlock() }
+            reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
+            guard !isTampered, let i = entries.firstIndex(where: { $0.publicKey == hex }) else { return }
+            entries[i].lastSeen = Date()
+            try? persist()
+        }
     }
 
     /// 指紋 (表示用) または公開鍵 hex の先頭一致で削除。削除件数を返す。
     public func remove(matching query: String) throws -> Int {
-        let q = query.uppercased().replacingOccurrences(of: "-", with: "")
-        lock.lock(); defer { lock.unlock() }
-        reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
-        guard !isTampered else { throw StoreError.tampered }
-        let before = entries.count
-        entries.removeAll { e in
-            guard q.count >= 4, let key = Fingerprint.fromHex(e.publicKey) else { return false }
-            let fp = Fingerprint.display(key).replacingOccurrences(of: "-", with: "")
-            return fp.hasPrefix(q) || e.publicKey.uppercased().hasPrefix(q)
+        return try SecureFile.withLock(url) {
+            let q = query.uppercased().replacingOccurrences(of: "-", with: "")
+            lock.lock(); defer { lock.unlock() }
+            reloadLocked() // 別プロセスでの変更 (--revoke など) を上書きしない
+            guard !isTampered else { throw StoreError.tampered }
+            let before = entries.count
+            entries.removeAll { e in
+                guard q.count >= 4, let key = Fingerprint.fromHex(e.publicKey) else { return false }
+                let fp = Fingerprint.display(key).replacingOccurrences(of: "-", with: "")
+                return fp.hasPrefix(q) || e.publicKey.uppercased().hasPrefix(q)
+            }
+            try persist()
+            return before - entries.count
         }
-        try persist()
-        return before - entries.count
     }
 
     /// 一覧を空にして署名し直す (改ざんを検知したあとの復旧用)
     public func reset() throws {
-        lock.lock(); defer { lock.unlock() }
-        entries = []
-        isTampered = false
-        try persist()
+        return try SecureFile.withLock(url) {
+            lock.lock(); defer { lock.unlock() }
+            entries = []
+            isTampered = false
+            try persist()
+        }
     }
 
     private func persist() throws {
@@ -508,8 +580,13 @@ public final class TrustStore {
         let body = try enc.encode(entries)
         if let key = integrityKey {
             let text = String(decoding: body, as: UTF8.self)
-            let signed = Signed(version: 2, entries: text, mac: Fingerprint.hex(Self.mac(Array(body), key: key)))
+            let g = max(generation, Self.storedGeneration(url) ?? 0) + 1
+            let signed = Signed(version: 3, entries: text,
+                                mac: Fingerprint.hex(Self.mac(Array(body), key: key, generation: g)), generation: g)
             try SecureFile.write([UInt8](try enc.encode(signed)), to: url)
+            // ファイルを書いてから番号を覚える (途中で落ちても、ファイルの方が新しいだけで済む)
+            Self.storeGeneration(g, url)
+            generation = g
         } else {
             try SecureFile.write([UInt8](body), to: url)
         }
