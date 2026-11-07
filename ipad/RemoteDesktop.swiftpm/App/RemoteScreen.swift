@@ -226,8 +226,10 @@ struct RemoteScreenContainer: View {
         } label: {
             Image(systemName: "bolt.fill")
                 .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
                 .frame(width: 34, height: 34)
         }
+        .tint(.primary) // メニューの見出しを他のボタンと同じ色に
         .accessibilityLabel("ショートカット")
     }
 

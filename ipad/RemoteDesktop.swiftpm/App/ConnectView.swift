@@ -113,7 +113,7 @@ struct ConnectView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if lastConnected > 0 {
-                    Text("最後の接続: \(Date(timeIntervalSince1970: lastConnected).formatted(.relative(presentation: .named)))")
+                    Text("最後の接続: \(relativeJapanese(Date(timeIntervalSince1970: lastConnected)))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -331,4 +331,14 @@ final class HostFinder: ObservableObject {
 
     func start() { browser.start() }
     func stop() { browser.stop() }
+}
+
+/// 「3 分前」などの表記 (端末の言語設定によらず日本語で)
+func relativeJapanese(_ d: Date) -> String {
+    let s = Int(Date().timeIntervalSince(d))
+    if s < 60 { return "たった今" }
+    if s < 3600 { return "\(s / 60) 分前" }
+    if s < 86400 { return "\(s / 3600) 時間前" }
+    if s < 86400 * 7 { return "\(s / 86400) 日前" }
+    return d.formatted(date: .numeric, time: .omitted)
 }
