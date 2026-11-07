@@ -292,6 +292,8 @@ public final class TCPConnection: ByteStream {
 public final class TCPListener {
     private let fd: NativeSocket
     public let port: UInt16
+    private let closeLock = NSLock()
+    private var closed = false
 
     /// bindAddress:port で待ち受ける (IPv4)。bindAddress が nil なら全インターフェース。
     public init(port: UInt16, bindAddress: String? = nil) throws {
@@ -325,7 +327,27 @@ public final class TCPListener {
         fd = s
     }
 
-    deinit { rawClose(fd) }
+    deinit {
+        closeLock.lock()
+        let wasClosed = closed
+        closeLock.unlock()
+        if !wasClosed { rawClose(fd) }
+    }
+
+    /// 待ち受けをやめる。accept() で待っているスレッドはエラーで戻る (戻ったあとは accept を呼ばないこと)
+    public func close() {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        if closed { return }
+        closed = true
+        rawShutdown(fd)
+        rawClose(fd) // Windows は closesocket でないと accept が戻らない。ポートもすぐ空く
+    }
+
+    public var isClosed: Bool {
+        closeLock.lock(); defer { closeLock.unlock() }
+        return closed
+    }
 
     /// 実際に待ち受けているポート (port 0 で OS に選ばせたとき用)
     public var boundPort: UInt16 {

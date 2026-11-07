@@ -25,7 +25,7 @@ protocol InputInjector: AnyObject {
 }
 
 /// 最後のセッションが終わったときに画面をどうするか
-enum DisconnectAction: String {
+public enum DisconnectAction: String, CaseIterable {
     /// モニターを消す (その場の人に画面を見られにくくする。ローカルで触れば点く)
     case blank
     /// Windows をロックする (家に人がいる場合向け。ロック画面は遠隔から解除できないので次の接続は帰宅後)

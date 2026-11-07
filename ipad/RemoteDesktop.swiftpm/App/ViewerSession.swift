@@ -28,6 +28,47 @@ final class ViewerSession: ObservableObject {
 
     var isShowingScreen: Bool { phase == .connected }
 
+    /// 通信状況 (1 秒ごとに更新)
+    struct Stats: Equatable {
+        var fps = 0
+        var kbps = 0.0
+        var totalBytes = 0
+    }
+
+    @Published var stats = Stats()
+    private let statsLock = NSLock()
+    private var frameCount = 0
+    private var byteCount = 0
+    private var totalBytes = 0
+    private var statsTimer: Timer?
+    private var latestImage: CGImage?
+
+    /// 最後に受け取った画面 (スクリーンショット用)
+    var lastImage: CGImage? {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return latestImage
+    }
+
+    private func startStats() {
+        statsLock.lock(); frameCount = 0; byteCount = 0; totalBytes = 0; statsLock.unlock()
+        stats = Stats()
+        statsTimer?.invalidate()
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.statsLock.lock()
+            let s = Stats(fps: self.frameCount, kbps: Double(self.byteCount) * 8 / 1000, totalBytes: self.totalBytes)
+            self.frameCount = 0
+            self.byteCount = 0
+            self.statsLock.unlock()
+            if s != self.stats { self.stats = s }
+        }
+    }
+
+    private func stopStats() {
+        statsTimer?.invalidate()
+        statsTimer = nil
+    }
+
     /// 受信スレッドから呼ばれる (画面の更新)
     var onImage: ((CGImage) -> Void)?
 
@@ -86,6 +127,8 @@ final class ViewerSession: ObservableObject {
                     self.hostFingerprint = s.hostFingerprint
                     self.securitySummary = "\(s.isPostQuantum ? "耐量子暗号 (ML-KEM) + " : "")端末鍵: \(level.rawValue)"
                     self.phase = .connected
+                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastConnected")
+                    self.startStats()
                     if s.newlyPaired {
                         self.alert = AlertItem(
                             title: "ペアリングしました",
@@ -117,6 +160,7 @@ final class ViewerSession: ObservableObject {
     func disconnect() {
         channel?.close()
         channel = nil
+        stopStats()
         phase = .idle
     }
 
@@ -130,6 +174,7 @@ final class ViewerSession: ObservableObject {
         do {
             while true {
                 let (type, payload) = try ch.receive()
+                statsLock.lock(); byteCount += payload.count + 5; totalBytes += payload.count + 5; statsLock.unlock()
                 switch MessageType(rawValue: type) {
                 case .hello:
                     let h = try Hello.decode(payload)
@@ -140,7 +185,10 @@ final class ViewerSession: ObservableObject {
                 case .frame, .frame2:
                     try framebuffer.apply(payload, format: type == MessageType.frame2.rawValue ? .v2 : .v1)
                     try ch.send(.frameAck)
-                    if let img = makeImage(framebuffer) { onImage?(img) }
+                    if let img = makeImage(framebuffer) {
+                        statsLock.lock(); frameCount += 1; latestImage = img; statsLock.unlock()
+                        onImage?(img)
+                    }
                 default:
                     break
                 }
@@ -154,6 +202,7 @@ final class ViewerSession: ObservableObject {
         DispatchQueue.main.async {
             guard self.channel === ch else { return } // 自分で切断した場合
             self.channel = nil
+            self.stopStats()
             self.phase = .idle
             self.alert = AlertItem(title: "接続が終了しました", message: reason ?? "ホスト側で切断されました。")
         }

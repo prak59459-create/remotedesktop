@@ -16,6 +16,11 @@ final class ScreenshotDriver: ObservableObject {
     let pressConnect = PassthroughSubject<Void, Never>()
     let showTextSheet = PassthroughSubject<String, Never>()
     let toggleKeyboard = PassthroughSubject<Void, Never>()
+    let showSettings = PassthroughSubject<Bool, Never>()
+    let showAbout = PassthroughSubject<Bool, Never>()
+    let showKeys = PassthroughSubject<Bool, Never>()
+    let showStats = PassthroughSubject<Bool, Never>()
+    let showHelp = PassthroughSubject<Bool, Never>()
 
     private var started = false
     private let env = ProcessInfo.processInfo.environment
@@ -47,6 +52,18 @@ final class ScreenshotDriver: ObservableObject {
         finder.stop()
         await wait(1)
         await shot("01-connect-empty")
+
+        // 1b. このアプリについて / 1c. 設定
+        showAbout.send(true)
+        await wait(1.5)
+        await shot("01b-about")
+        showAbout.send(false)
+        await wait(1)
+        showSettings.send(true)
+        await wait(1.5)
+        await shot("01c-settings")
+        showSettings.send(false)
+        await wait(1)
 
         // 2. 外出先 (中継) に切り替え
         d.set("外出先 (中継)", forKey: "mode")
@@ -95,6 +112,22 @@ final class ScreenshotDriver: ObservableObject {
 
         // 6. リモート画面 (横向き)
         await shot("07-remote-landscape")
+
+        // 6b. 特殊キーのパネルと通信状況
+        showKeys.send(true)
+        showStats.send(true)
+        await wait(2)
+        await shot("07b-remote-keys-stats")
+        showKeys.send(false)
+        showStats.send(false)
+        await wait(1)
+
+        // 6c. 操作方法
+        showHelp.send(true)
+        await wait(1.5)
+        await shot("07c-help")
+        showHelp.send(false)
+        await wait(1)
 
         // 7. 入力が届くことの確認用に、マウスとキーを少し送る
         session.send(.mouseMove(x: 320, y: 200))
